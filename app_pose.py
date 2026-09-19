@@ -40,8 +40,13 @@ from mediapipe.tasks.python import vision
 
 POSE_MODEL_PATH = "models/pose_landmarker_lite.task"
 
-USE_SEGMENTATION = True
-MASK_THRESH = 0.2
+# Cuantos ms espera la interfaz entre repintados. El hilo de proceso
+# va por su cuenta; esto solo marca cada cuanto se recoge lo ultimo.
+MS_ENTRE_PINTADOS = 16
+
+# Tope de ancho al mostrar el video. Ampliar mas no anade detalle y el
+# coste de subir la imagen a Tk crece con el area.
+ANCHO_MAX_VIDEO = 960
 
 PREFIJO_IP_CELULAR = "192.168.1."
 PUERTO_IP_WEBCAM = "8080"
@@ -57,44 +62,78 @@ ROTACIONES = {
 # =================================
 # Tokens de diseno
 # =================================
-# Escala azul sobre base oscura. Se centralizan aqui en vez de repartir
-# hex sueltos por la interfaz, para que el cambio de color se haga en un
-# solo sitio y para que la version Flutter (Fase 5) parta de los mismos
-# valores.
+# La aplicacion no se mira sentado frente al monitor: se mira de reojo,
+# a dos o tres metros, mientras se hace el ejercicio. Todo lo de abajo
+# sale de ahi.
 #
-# Verde y rojo se quedan fuera de la escala azul a proposito: son los
-# unicos dos colores que significan algo (postura correcta / alerta) y
-# tienen que distinguirse del resto de la interfaz.
+# Tema oscuro. El verde de la superficie no es negro tenido: tiene
+# croma propia, de la misma familia que los dos colores de estado.
+#
+# Contrastes comprobados sobre "superficie": texto 12.9:1, tenue 5.8:1.
+# Blanco sobre los dos campos de estado: 5.3:1 y 5.4:1.
 
 COLOR = {
-    "fondo": "#0F172A",
-    "superficie": "#1B2336",
-    "superficie_alta": "#272F42",
-    "borde": "#475569",
-    "texto": "#F8FAFC",
-    "texto_tenue": "#94A3B8",
-    "primario": "#2563EB",
-    "primario_hover": "#1D4ED8",
-    "sobre_primario": "#FFFFFF",
-    "dato": "#60A5FA",
-    "exito": "#22C55E",
-    "peligro": "#EF4444",
-    "peligro_hover": "#DC2626",
-    "sobre_peligro": "#FFFFFF",
+    # Nombres por funcion, no por material: cambiar el tema no obliga a
+    # renombrar nada.
+    "texto": "#E6EBE6",
+    "superficie": "#1B2623",
+    "campo": "#24312D",
+    "tenue": "#93A199",
+    "filete": "#35443F",
+    "lienzo": "#111917",
+    "correcto": "#1F7A50",
+    "alerta": "#C03A20",
+    "sobre_campo": "#FFFFFF",
 }
 
-ESPACIO = {"xs": 4, "sm": 8, "md": 12, "lg": 20}
+ESPACIO = {"xs": 4, "sm": 8, "md": 14, "lg": 22, "xl": 30}
 
 # Los mismos colores para lo que se dibuja sobre el video. OpenCV usa
 # BGR, no RGB, asi que van invertidos respecto al hex de arriba.
-BGR_SKELETON = (250, 165, 96)   # #60A5FA
-BGR_TRONCO = (235, 99, 37)      # #2563EB
+BGR_SKELETON = (230, 235, 230)  # #E6EBE6, el mismo texto del panel
+BGR_TRONCO = (80, 122, 31)      # #1F7A50
 
-# Barlow es la tipografia elegida para el proyecto, pero no viene
-# instalada en Windows. Si no esta, se cae a la fuente del sistema en
-# vez de dejar que Tk elija una cualquiera en silencio.
-FAMILIAS_TITULO = ("Barlow Condensed", "Barlow", "Segoe UI Semibold", "Segoe UI")
-FAMILIAS_TEXTO = ("Barlow", "Segoe UI", "Arial")
+# Bahnschrift es la version que trae Windows de la DIN: la letra de los
+# planos tecnicos y la senaletica. Encaja con un instrumento de medida
+# y sus digitos condensados dejan poner numeros grandes sin desbordar.
+#
+# Se comprueba que este instalada en vez de darlo por hecho: pedir una
+# familia ausente no da error, Tk sustituye en silencio y el diseno se
+# cae sin que nadie se entere.
+FAMILIAS_TITULO = ("Bahnschrift SemiBold", "Bahnschrift", "Segoe UI Semibold")
+FAMILIAS_TEXTO = ("Bahnschrift Light", "Bahnschrift", "Segoe UI")
+FAMILIAS_CIFRA = ("Bahnschrift SemiCondensed", "Bahnschrift", "Segoe UI")
+
+
+def completar_direccion(texto):
+    """Convierte lo que se escriba a mano en una URL de video.
+
+    Dos reglas, sin adivinar mas alla de eso:
+
+    - Si ya trae esquema (http://...), se usa tal cual. Quien escribe
+      una URL entera sabe lo que quiere y no hay que tocarsela.
+    - Si no, se toma como host, con puerto opcional, y se le pone el
+      puerto por defecto y la ruta /video de IP Webcam.
+
+    >>> completar_direccion("192.168.0.25")
+    'http://192.168.0.25:8080/video'
+    >>> completar_direccion("192.168.0.25:4747")
+    'http://192.168.0.25:4747/video'
+    >>> completar_direccion("http://10.0.0.5:8080/videofeed")
+    'http://10.0.0.5:8080/videofeed'
+    """
+    texto = texto.strip()
+
+    if not texto:
+        return ""
+
+    if "://" in texto:
+        return texto
+
+    if ":" not in texto:
+        texto = f"{texto}:{PUERTO_IP_WEBCAM}"
+
+    return f"http://{texto}/video"
 
 
 def primera_familia_disponible(candidatas):
@@ -121,11 +160,35 @@ TOBILLO_D = 28
 
 
 # =================================
-# Umbrales (placeholder, pendientes de calibrar con datos reales)
+# Umbrales
 # =================================
-
+# El indice de encorvamiento es la distancia perpendicular de la oreja
+# a la recta cadera-hombro, dividida por el largo del tronco. Con las
+# proporciones antropometricas estandar (Drillis & Contini) el tronco
+# mide 0.288 de la estatura y el tramo hombro-oreja 0.112, o sea una
+# razon d/L = 0.389. De ahi:
+#
+#       indice = 0.389 * sin(adelantamiento de la cabeza)
+#
+#   indice 0.07 ->  10 grados
+#   indice 0.10 ->  15 grados
+#   indice 0.13 ->  20 grados
+#   indice 0.19 ->  30 grados   <- era el valor anterior
+#
+# 30 grados es encorvamiento severo: por eso avisaba tan tarde. 15 es
+# donde ya se nota a simple vista.
+#
+# Sigue siendo una estimacion sobre proporciones medias, no una
+# calibracion. Para ajustarlo al cuerpo y al angulo de camara reales,
+# usar calibrar_encorvamiento.py.
 UMBRAL_INCLINACION = 20.0
-UMBRAL_JOROBA = 0.20
+UMBRAL_JOROBA = 0.10
+
+# Histeresis: al bajar el umbral, los valores rondando el limite
+# encienden y apagan la alerta varias veces por segundo y el campo de
+# color parpadea. Con margen, encender cuesta mas que apagar.
+MARGEN_JOROBA = 0.02
+MARGEN_INCLINACION = 3.0
 
 
 # =================================
@@ -268,19 +331,35 @@ class LectorCamara:
         self.captura.release()
 
 
-def clasificar_postura(angulo_inclinacion, indice_joroba):
+def clasificar_postura(angulo_inclinacion, indice_joroba,
+                       alerta_previa=False):
     """Devuelve (texto, hay_alerta).
 
     El booleano se usa para resaltar la postura en la interfaz; el
     texto por si solo ya dice que pasa, el color solo lo refuerza.
+
+    `alerta_previa` aplica la histeresis: si ya habia alerta, hace
+    falta bajar mas para apagarla.
+
+    >>> clasificar_postura(0.0, 0.05)
+    ('Espalda recta', False)
+    >>> clasificar_postura(0.0, 0.12)
+    ('Posible encorvamiento', True)
+    >>> clasificar_postura(0.0, 0.09, alerta_previa=True)[1]
+    True
+    >>> clasificar_postura(0.0, 0.09, alerta_previa=False)[1]
+    False
     """
+    margen_j = MARGEN_JOROBA if alerta_previa else 0.0
+    margen_i = MARGEN_INCLINACION if alerta_previa else 0.0
+
     etiquetas = []
 
-    if abs(angulo_inclinacion) > UMBRAL_INCLINACION:
+    if abs(angulo_inclinacion) > UMBRAL_INCLINACION - margen_i:
         lado = "adelante" if angulo_inclinacion > 0 else "atras"
         etiquetas.append(f"Inclinado {lado}")
 
-    if abs(indice_joroba) > UMBRAL_JOROBA:
+    if abs(indice_joroba) > UMBRAL_JOROBA - margen_j:
         etiquetas.append("Posible encorvamiento")
 
     if not etiquetas:
@@ -310,13 +389,16 @@ class PoseApp(ctk.CTk):
         # F11 da pantalla completa real (sin barra de titulo) y Escape
         # vuelve a la ventana normal.
         self.pantalla_completa = False
-        self.after(0, lambda: self.state("zoomed"))
+        self._ya_maximizada = False
+        # Se engancha a <Map> y no a after(0): CustomTkinter aplica su
+        # propia geometria en un callback diferido posterior, que
+        # deshacia el maximizado y devolvia la ventana a 1100x700.
+        self.bind("<Map>", self._maximizar_al_abrir)
         self.bind("<F11>", self._alternar_pantalla_completa)
         self.bind("<Escape>", self._salir_pantalla_completa)
 
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-        self.configure(fg_color=COLOR["fondo"])
+        self.configure(fg_color=COLOR["lienzo"])
 
         self.cap = None
         self.detector = None
@@ -324,6 +406,23 @@ class PoseApp(ctk.CTk):
 
         self.start_time = 0.0
         self.previous_time = 0.0
+        self.fps_medido = 0.0
+        self.alerta_previa = False
+
+        # Buzon de un solo hueco entre el hilo de proceso y el de la
+        # interfaz: solo interesa el ultimo frame, los viejos sobran.
+        self.ultima_salida = None
+        self.candado_salida = threading.Lock()
+        self.hilo_proceso = None
+        self.senal_perdida = False
+
+        # El hilo de proceso no puede consultar el desplegable: Tk solo
+        # admite llamadas desde el hilo principal. La interfaz deja
+        # aqui el valor elegido y el hilo lo lee.
+        self.rotacion_actual = "Sin rotar"
+
+        # PhotoImage que se reutiliza entre frames.
+        self.imagen_tk = None
 
         self._construir_fuentes()
         self._construir_ui()
@@ -333,19 +432,34 @@ class PoseApp(ctk.CTk):
         # crean aqui y no como constantes de modulo.
         titulo = primera_familia_disponible(FAMILIAS_TITULO)
         texto = primera_familia_disponible(FAMILIAS_TEXTO)
+        cifra = primera_familia_disponible(FAMILIAS_CIFRA)
 
-        self.fuente_seccion = ctk.CTkFont(family=titulo, size=15, weight="bold")
+        self.fuente_seccion = ctk.CTkFont(family=titulo, size=13)
         self.fuente_texto = ctk.CTkFont(family=texto, size=14)
-        self.fuente_valor = ctk.CTkFont(family=texto, size=14, weight="bold")
-        self.fuente_postura = ctk.CTkFont(family=titulo, size=22, weight="bold")
-        self.fuente_estado = ctk.CTkFont(family=texto, size=12)
+        self.fuente_boton = ctk.CTkFont(family=titulo, size=15)
 
-        # Los numeros son lo que se mira de reojo mientras se hace el
-        # ejercicio: van grandes y con su unidad aparte, mas pequena,
-        # para que la cifra no compita con el "grados".
-        self.fuente_dato = ctk.CTkFont(family=titulo, size=30, weight="bold")
-        self.fuente_unidad = ctk.CTkFont(family=texto, size=12)
-        self.fuente_etiqueta = ctk.CTkFont(family=texto, size=11)
+        # El veredicto se lee a varios metros, de reojo y en
+        # movimiento: por eso es lo unico que va a este tamano.
+        self.fuente_veredicto = ctk.CTkFont(family=titulo, size=34)
+
+        # Los angulos se leen en una hoja de medidas, no en tarjetas.
+        # Van alineados a la derecha para que los digitos no se
+        # desplacen al cambiar de dos a tres cifras.
+        self.fuente_medida = ctk.CTkFont(family=cifra, size=26)
+        self.fuente_etiqueta = ctk.CTkFont(family=texto, size=15)
+        self.fuente_pie = ctk.CTkFont(family=texto, size=12)
+
+    def _maximizar_al_abrir(self, evento=None):
+        """Maximiza una sola vez, cuando la ventana ya esta en pantalla.
+
+        Solo la primera vez: si no, restaurar la ventana desde la barra
+        de tareas la volveria a maximizar y no se podria dejar pequena.
+        """
+        if self._ya_maximizada:
+            return
+
+        self._ya_maximizada = True
+        self.after_idle(lambda: self.state("zoomed"))
 
     def _alternar_pantalla_completa(self, evento=None):
         self.pantalla_completa = not self.pantalla_completa
@@ -362,266 +476,268 @@ class PoseApp(ctk.CTk):
 
     def _construir_ui(self):
 
-        # Panel fijo a la derecha (evita que sus controles se
-        # deformen al maximizar); el video ocupa todo el resto.
+        # El video manda en superficie; el panel es una columna fija a
+        # la derecha, ancha para que los angulos entren grandes.
         self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=0, minsize=400)
+        self.grid_columnconfigure(1, weight=0, minsize=420)
         self.grid_rowconfigure(0, weight=1)
 
-        # --- Panel de video (izquierda) ---
-        self.frame_video = ctk.CTkFrame(self, fg_color="black")
-        self.frame_video.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        # --- Video (izquierda) ---
+        # Sin esquinas redondeadas ni margen: es la imagen de un
+        # instrumento, no una tarjeta.
+        self.frame_video = ctk.CTkFrame(
+            self, fg_color=COLOR["lienzo"], corner_radius=0,
+        )
+        self.frame_video.grid(row=0, column=0, sticky="nsew")
         self.frame_video.grid_columnconfigure(0, weight=1)
         self.frame_video.grid_rowconfigure(0, weight=1)
 
         self.label_video = ctk.CTkLabel(self.frame_video, text="")
         self.label_video.grid(row=0, column=0, sticky="nsew")
 
-        # Tamano disponible para el video, actualizado cuando el
-        # usuario redimensiona la ventana.
         self._video_box = (800, 600)
         self.frame_video.bind("<Configure>", self._on_video_resize)
 
-        # --- Panel lateral (derecha) ---
-        # El contenedor fija el ancho y el estado se ancla abajo.
-        #
-        # Aqui hubo un CTkScrollableFrame y se quito: su canvas interno
-        # no repinta lo anterior cuando el contenido cambia de altura
-        # (la etiqueta de postura crece y encoge segun el texto) y el
-        # bucle de video no deja hueco al redibujado, asi que los
-        # widgets quedaban superpuestos unos sobre otros. Con la
-        # ventana maximizada todo cabe sin scroll.
-        lateral = ctk.CTkFrame(self, width=400, fg_color=COLOR["superficie"])
-        lateral.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
-        lateral.grid_propagate(False)
-        lateral.grid_columnconfigure(0, weight=1)
-        lateral.grid_rowconfigure(0, weight=1)
+        # --- Panel (derecha) ---
+        panel = ctk.CTkFrame(
+            self, width=420, fg_color=COLOR["superficie"], corner_radius=0,
+        )
+        panel.grid(row=0, column=1, sticky="nsew")
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+        # El sobrante se lo queda un hueco despues de las medidas, no
+        # el veredicto: con weight en el campo de color, el texto
+        # quedaba flotando en mitad de 300px de rojo.
+        panel.grid_rowconfigure(4, weight=1)
 
-        panel = ctk.CTkFrame(lateral, fg_color="transparent")
-        panel.grid(row=0, column=0, sticky="nsew")
+        # ---- Controles: arriba y deliberadamente discretos ----
+        controles = ctk.CTkFrame(panel, fg_color="transparent")
+        controles.grid(row=0, column=0, sticky="ew",
+                       padx=ESPACIO["lg"], pady=(ESPACIO["lg"], 0))
+        controles.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(
-            panel, text="Fuente de camara", font=self.fuente_seccion,
-            text_color=COLOR["texto"],
-        ).pack(pady=(ESPACIO["sm"], 0), anchor="w", padx=ESPACIO["md"])
-
+        self._etiqueta_control(controles, 0, "Camara")
         self.tipo_camara = ctk.CTkSegmentedButton(
-            panel, values=["PC (webcam)", "Celular (WiFi)"],
+            controles, values=["Esta PC", "Celular"],
             command=self._cambiar_tipo_camara,
-            font=self.fuente_texto,
-            selected_color=COLOR["primario"],
-            selected_hover_color=COLOR["primario_hover"],
+            font=self.fuente_texto, corner_radius=0, border_width=1,
+            # CTkSegmentedButton usa un unico text_color para las dos
+            # opciones. Con texto claro, la activa tiene que seguir
+            # siendo oscura: se distingue por ser mas clara que la
+            # inactiva, no por invertir el texto.
+            fg_color=COLOR["superficie"], unselected_color=COLOR["superficie"],
+            unselected_hover_color=COLOR["campo"],
+            selected_color=COLOR["filete"],
+            selected_hover_color=COLOR["filete"],
             text_color=COLOR["texto"],
         )
-        self.tipo_camara.set("PC (webcam)")
-        self.tipo_camara.pack(pady=ESPACIO["sm"], padx=ESPACIO["md"], fill="x")
+        self.tipo_camara.set("Esta PC")
+        self.tipo_camara.grid(row=0, column=1, sticky="ew", pady=ESPACIO["xs"])
 
-        # Contenedor fijo para los campos de la fuente. Sin el, al
-        # cambiar de opcion el pack() reinsertaba el frame al final del
-        # panel y los campos saltaban debajo de todo.
-        self.frame_fuente = ctk.CTkFrame(panel, fg_color="transparent")
-        self.frame_fuente.pack(
-            pady=ESPACIO["sm"], padx=ESPACIO["md"], fill="x"
-        )
+        self._etiqueta_control(controles, 1, "Origen")
+        self.frame_fuente = ctk.CTkFrame(controles, fg_color="transparent")
+        self.frame_fuente.grid(row=1, column=1, sticky="ew",
+                               pady=ESPACIO["xs"])
 
-        # --- Opcion: webcam del PC ---
         self.frame_fuente_pc = ctk.CTkFrame(
             self.frame_fuente, fg_color="transparent"
         )
-
-        # Etiqueta visible: el placeholder desaparece al escribir y
-        # deja el campo sin identificar.
-        ctk.CTkLabel(
-            self.frame_fuente_pc, text="Indice de camara",
-            font=self.fuente_texto, text_color=COLOR["texto_tenue"],
-        ).pack(anchor="w")
-
         self.entry_indice_pc = ctk.CTkEntry(
-            self.frame_fuente_pc, placeholder_text="0, 1, ...",
-            font=self.fuente_texto, border_color=COLOR["borde"],
+            self.frame_fuente_pc, font=self.fuente_texto, corner_radius=0,
+            fg_color=COLOR["campo"], border_color=COLOR["filete"],
+            text_color=COLOR["texto"], border_width=1,
         )
         self.entry_indice_pc.insert(0, "0")
-        self.entry_indice_pc.pack(fill="x", pady=(ESPACIO["xs"], 0))
+        self.entry_indice_pc.pack(fill="x")
 
-        # --- Opcion: celular por IP Webcam ---
-        # Solo se escribe el ultimo numero de la IP (el que suele
-        # cambiar); el prefijo y el puerto quedan fijos.
+        # --- Opcion: celular ---
+        # Dos formas de dar la direccion. La corta sirve cuando el
+        # celular esta en la red de siempre y solo cambia el ultimo
+        # numero; la completa, cuando se cambia de red o de puerto.
         self.frame_fuente_celular = ctk.CTkFrame(
             self.frame_fuente, fg_color="transparent"
         )
 
-        ctk.CTkLabel(
-            self.frame_fuente_celular, text="Direccion del celular",
-            font=self.fuente_texto, text_color=COLOR["texto_tenue"],
-        ).pack(anchor="w")
+        self.modo_direccion = ctk.CTkSegmentedButton(
+            self.frame_fuente_celular,
+            values=["Ultimo numero", "Direccion completa"],
+            command=self._cambiar_modo_direccion,
+            font=self.fuente_texto, corner_radius=0, border_width=1,
+            fg_color=COLOR["superficie"], unselected_color=COLOR["superficie"],
+            unselected_hover_color=COLOR["campo"],
+            selected_color=COLOR["filete"],
+            selected_hover_color=COLOR["filete"],
+            text_color=COLOR["texto"],
+        )
+        self.modo_direccion.set("Ultimo numero")
+        self.modo_direccion.pack(fill="x", pady=(0, ESPACIO["xs"]))
 
-        fila_ip = ctk.CTkFrame(self.frame_fuente_celular, fg_color="transparent")
-        fila_ip.pack(fill="x", pady=(ESPACIO["xs"], 0))
-
+        self.frame_ip_corta = ctk.CTkFrame(
+            self.frame_fuente_celular, fg_color="transparent"
+        )
         ctk.CTkLabel(
-            fila_ip, text=f"http://{PREFIJO_IP_CELULAR}",
-            font=self.fuente_texto, text_color=COLOR["texto"],
+            self.frame_ip_corta, text=PREFIJO_IP_CELULAR,
+            font=self.fuente_texto, text_color=COLOR["tenue"],
         ).pack(side="left")
-
         self.entry_ip_final = ctk.CTkEntry(
-            fila_ip, width=56, font=self.fuente_texto,
-            border_color=COLOR["borde"],
+            self.frame_ip_corta, width=58, font=self.fuente_texto,
+            corner_radius=0, fg_color=COLOR["campo"],
+            border_color=COLOR["filete"], text_color=COLOR["texto"],
+            border_width=1,
         )
         self.entry_ip_final.insert(0, "8")
         self.entry_ip_final.pack(side="left", padx=ESPACIO["xs"])
-
         ctk.CTkLabel(
-            fila_ip, text=f":{PUERTO_IP_WEBCAM}/video",
-            font=self.fuente_texto, text_color=COLOR["texto"],
+            self.frame_ip_corta, text=":" + PUERTO_IP_WEBCAM,
+            font=self.fuente_texto, text_color=COLOR["tenue"],
         ).pack(side="left")
+
+        self.entry_ip_completa = ctk.CTkEntry(
+            self.frame_fuente_celular, font=self.fuente_texto,
+            corner_radius=0, fg_color=COLOR["campo"],
+            border_color=COLOR["filete"], text_color=COLOR["texto"],
+            placeholder_text_color=COLOR["tenue"], border_width=1,
+            placeholder_text="192.168.0.25  o  http://...:8080/video",
+        )
+
+        self.frame_ip_corta.pack(fill="x")
 
         self.frame_fuente_pc.pack(fill="x")
 
-        ctk.CTkLabel(
-            panel, text="Rotacion", font=self.fuente_seccion,
-            text_color=COLOR["texto"],
-        ).pack(pady=(ESPACIO["md"], 0), anchor="w", padx=ESPACIO["md"])
-
+        self._etiqueta_control(controles, 2, "Giro")
         self.combo_rotacion = ctk.CTkOptionMenu(
-            panel, values=list(ROTACIONES.keys()), font=self.fuente_texto,
-            fg_color=COLOR["borde"], button_color=COLOR["primario"],
-            button_hover_color=COLOR["primario_hover"],
+            controles, values=list(ROTACIONES.keys()),
+            font=self.fuente_texto, corner_radius=0,
+            fg_color=COLOR["campo"], button_color=COLOR["filete"],
+            button_hover_color=COLOR["tenue"],
             text_color=COLOR["texto"],
         )
-        self.combo_rotacion.pack(pady=ESPACIO["sm"], padx=ESPACIO["md"], fill="x")
+        self.combo_rotacion.grid(row=2, column=1, sticky="ew",
+                                 pady=ESPACIO["xs"])
 
         botones = ctk.CTkFrame(panel, fg_color="transparent")
-        botones.pack(pady=ESPACIO["md"], padx=ESPACIO["md"], fill="x")
+        botones.grid(row=1, column=0, sticky="ew",
+                     padx=ESPACIO["lg"], pady=ESPACIO["md"])
+        botones.grid_columnconfigure(0, weight=1)
+        botones.grid_columnconfigure(1, weight=1)
 
-        # height=40 deja los botones sobre el minimo comodo de click y
-        # los iguala entre si.
         self.boton_iniciar = ctk.CTkButton(
-            botones, text="Iniciar", command=self.iniciar, height=40,
-            font=self.fuente_valor,
-            fg_color=COLOR["primario"], hover_color=COLOR["primario_hover"],
-            text_color=COLOR["sobre_primario"],
+            botones, text="Empezar", command=self.iniciar, height=46,
+            font=self.fuente_boton, corner_radius=0,
+            fg_color=COLOR["texto"], hover_color="#FFFFFF",
+            text_color=COLOR["superficie"],
+            text_color_disabled=COLOR["filete"],
         )
-        self.boton_iniciar.pack(
-            side="left", expand=True, fill="x", padx=(0, ESPACIO["xs"])
-        )
+        self.boton_iniciar.grid(row=0, column=0, sticky="ew",
+                                padx=(0, ESPACIO["xs"]))
 
         self.boton_detener = ctk.CTkButton(
-            botones, text="Detener", command=self.detener, height=40,
-            font=self.fuente_valor,
-            fg_color=COLOR["peligro"], hover_color=COLOR["peligro_hover"],
-            text_color=COLOR["sobre_peligro"],
-        )
-        self.boton_detener.pack(
-            side="left", expand=True, fill="x", padx=(ESPACIO["xs"], 0)
-        )
-
-        # --- Postura: es la salida principal del proyecto, va primero
-        # y con mas peso visual que las metricas de apoyo. ---
-        tarjeta_postura = ctk.CTkFrame(
-            panel, fg_color=COLOR["fondo"], border_width=2,
-            border_color=COLOR["borde"],
-        )
-        tarjeta_postura.pack(
-            pady=(ESPACIO["sm"], ESPACIO["md"]), padx=ESPACIO["md"], fill="x"
-        )
-
-        ctk.CTkLabel(
-            tarjeta_postura, text="POSTURA", font=self.fuente_estado,
-            text_color=COLOR["texto_tenue"],
-        ).pack(pady=(ESPACIO["sm"], 0), padx=ESPACIO["md"], anchor="w")
-
-        # height fijo: el texto ocupa una o dos lineas segun la postura
-        # detectada. Sin reservar el alto, la tarjeta crece y encoge
-        # varias veces por segundo y arrastra todo el panel con ella.
-        self.label_postura = ctk.CTkLabel(
-            tarjeta_postura, text="--", font=self.fuente_postura,
-            text_color=COLOR["texto_tenue"], wraplength=330, justify="left",
-            height=68, anchor="w",
-        )
-        self.label_postura.pack(
-            pady=(0, ESPACIO["sm"]), padx=ESPACIO["md"], anchor="w"
-        )
-
-        ctk.CTkLabel(
-            panel, text="Valores en vivo", font=self.fuente_seccion,
+            botones, text="Parar", command=self.detener, height=46,
+            font=self.fuente_boton, corner_radius=0,
+            fg_color="transparent", hover_color=COLOR["campo"],
+            border_width=1, border_color=COLOR["filete"],
             text_color=COLOR["texto"],
-        ).pack(pady=(ESPACIO["sm"], ESPACIO["xs"]), anchor="w", padx=ESPACIO["md"])
+            text_color_disabled=COLOR["filete"],
+        )
+        self.boton_detener.grid(row=0, column=1, sticky="ew",
+                                padx=(ESPACIO["xs"], 0))
 
-        # Cuadricula de dos columnas: los cuatro angulos se leen de un
-        # vistazo mientras se hace el ejercicio, sin buscar el numero al
-        # final de una linea de texto.
+        # ---- Veredicto: el unico elemento con volumen ----
+        # Un campo de color a todo el ancho, no una etiqueta pequena.
+        # La vision periferica capta una superficie de color; no capta
+        # un texto de 20px a tres metros.
+        self.campo_veredicto = ctk.CTkFrame(
+            panel, fg_color=COLOR["filete"], corner_radius=0, height=160,
+        )
+        self.campo_veredicto.grid(row=2, column=0, sticky="nsew")
+        self.campo_veredicto.grid_propagate(False)
+        self.campo_veredicto.grid_columnconfigure(0, weight=1)
+        self.campo_veredicto.grid_rowconfigure(0, weight=1)
+
+        self.label_veredicto = ctk.CTkLabel(
+            self.campo_veredicto, text="Sin lectura",
+            font=self.fuente_veredicto, text_color=COLOR["tenue"],
+            wraplength=360, justify="left", anchor="w",
+        )
+        self.label_veredicto.grid(row=0, column=0, sticky="nsew",
+                                  padx=ESPACIO["lg"], pady=ESPACIO["md"])
+
+        # ---- Medidas: hoja de datos, no tarjetas ----
+        medidas = ctk.CTkFrame(panel, fg_color="transparent")
+        medidas.grid(row=3, column=0, sticky="ew",
+                     padx=ESPACIO["lg"], pady=(ESPACIO["md"], 0))
+        medidas.grid_columnconfigure(0, weight=1)
+        medidas.grid_columnconfigure(1, weight=0)
+
         self.valores = {}
 
-        rejilla = ctk.CTkFrame(panel, fg_color="transparent")
-        rejilla.pack(padx=ESPACIO["md"], fill="x")
-        rejilla.grid_columnconfigure(0, weight=1, uniform="dato")
-        rejilla.grid_columnconfigure(1, weight=1, uniform="dato")
-
-        metricas = [
-            ("rodilla", "RODILLA", "grados"),
-            ("cadera", "CADERA", "grados"),
-            ("inclinacion", "INCLINACION", "grados"),
-            ("joroba", "ENCORVAMIENTO", "indice"),
+        filas = [
+            ("rodilla", "Rodilla"),
+            ("cadera", "Cadera"),
+            ("inclinacion", "Tronco"),
+            ("joroba", "Encorvamiento"),
         ]
 
-        for posicion, (clave, etiqueta, unidad) in enumerate(metricas):
-            fila, columna = divmod(posicion, 2)
-
-            tarjeta = ctk.CTkFrame(rejilla, fg_color=COLOR["superficie_alta"])
-            tarjeta.grid(
-                row=fila, column=columna, padx=ESPACIO["xs"],
-                pady=ESPACIO["xs"], sticky="nsew",
-            )
+        for indice, (clave, etiqueta) in enumerate(filas):
+            fila = indice * 2
 
             ctk.CTkLabel(
-                tarjeta, text=etiqueta, font=self.fuente_etiqueta,
-                text_color=COLOR["texto_tenue"],
-            ).pack(pady=(ESPACIO["sm"], 0), padx=ESPACIO["sm"])
+                medidas, text=etiqueta, font=self.fuente_etiqueta,
+                text_color=COLOR["tenue"], anchor="w",
+            ).grid(row=fila, column=0, sticky="w", pady=ESPACIO["xs"])
 
-            valor_label = ctk.CTkLabel(
-                tarjeta, text="--", font=self.fuente_dato,
-                text_color=COLOR["dato"],
+            valor = ctk.CTkLabel(
+                medidas, text="—", font=self.fuente_medida,
+                text_color=COLOR["texto"], anchor="e",
             )
-            valor_label.pack(padx=ESPACIO["sm"])
+            valor.grid(row=fila, column=1, sticky="e", pady=ESPACIO["xs"])
+            self.valores[clave] = valor
 
-            ctk.CTkLabel(
-                tarjeta, text=unidad, font=self.fuente_unidad,
-                text_color=COLOR["texto_tenue"],
-            ).pack(pady=(0, ESPACIO["sm"]), padx=ESPACIO["sm"])
+            # Filete entre filas: separa datos tabulares, que es
+            # informacion, no adorno. La ultima fila no lo lleva.
+            if indice < len(filas) - 1:
+                ctk.CTkFrame(
+                    medidas, height=1, fg_color=COLOR["filete"],
+                    corner_radius=0,
+                ).grid(row=fila + 1, column=0, columnspan=2, sticky="ew")
 
-            self.valores[clave] = valor_label
+        # Hueco elastico: empuja el pie al fondo del panel.
+        ctk.CTkFrame(panel, fg_color="transparent", height=1).grid(
+            row=4, column=0, sticky="nsew"
+        )
 
-        # Los FPS son diagnostico, no una medida del ejercicio: van
-        # aparte y sin el peso visual de los angulos.
-        fila_fps = ctk.CTkFrame(panel, fg_color="transparent")
-        fila_fps.pack(pady=(ESPACIO["sm"], 0), padx=ESPACIO["lg"], fill="x")
+        # ---- Pie: estado a la izquierda, ritmo a la derecha ----
+        pie = ctk.CTkFrame(panel, fg_color="transparent")
+        pie.grid(row=5, column=0, sticky="ew",
+                 padx=ESPACIO["lg"], pady=ESPACIO["lg"])
+        pie.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
-            fila_fps, text="FPS", font=self.fuente_texto,
-            text_color=COLOR["texto_tenue"],
-        ).pack(side="left")
+        self.label_estado = ctk.CTkLabel(
+            pie, text="Detenido", font=self.fuente_pie,
+            text_color=COLOR["tenue"], anchor="w", justify="left",
+            wraplength=270,
+        )
+        self.label_estado.grid(row=0, column=0, sticky="w")
 
         self.valores["fps"] = ctk.CTkLabel(
-            fila_fps, text="--", font=self.fuente_valor,
-            text_color=COLOR["texto"],
+            pie, text="", font=self.fuente_pie,
+            text_color=COLOR["tenue"], anchor="e",
         )
-        self.valores["fps"].pack(side="right")
-
-        # Anclado al contenedor, no al area con scroll: el estado debe
-        # verse siempre.
-        self.label_estado = ctk.CTkLabel(
-            lateral, text="Detenido", font=self.fuente_estado,
-            text_color=COLOR["texto_tenue"],
-        )
-        self.label_estado.grid(
-            row=1, column=0, pady=ESPACIO["sm"], padx=ESPACIO["md"]
-        )
+        self.valores["fps"].grid(row=0, column=1, sticky="e")
 
         self._actualizar_botones()
 
-    # ---------------------------------
-    # Control de camara / deteccion
-    # ---------------------------------
+    def _etiqueta_control(self, padre, fila, texto):
+        """Etiqueta en caja baja, a la izquierda de su control.
+
+        Antes iba encima y en mayusculas: tres etiquetas apiladas que
+        empujaban los controles hacia abajo sin aportar nada. Compartir
+        fila con el campo ahorra alto y las relaciona sin ruido.
+        """
+        ctk.CTkLabel(
+            padre, text=texto, font=self.fuente_seccion,
+            text_color=COLOR["tenue"], anchor="w", width=78,
+        ).grid(row=fila, column=0, sticky="w", padx=(0, ESPACIO["sm"]))
 
     def _actualizar_botones(self):
         """Deja habilitado solo el boton que hace algo ahora mismo.
@@ -637,12 +753,31 @@ class PoseApp(ctk.CTk):
             state="normal" if self.corriendo else "disabled"
         )
 
-    def _set_estado(self, texto, color):
-        self.label_estado.configure(text=texto, text_color=color)
+    def _set_estado(self, texto, color=None):
+        self.label_estado.configure(
+            text=texto, text_color=color or COLOR["tenue"]
+        )
+
+    def _set_veredicto(self, texto, fondo, tinte):
+        """Pinta el campo de veredicto entero, no solo el texto."""
+        self.campo_veredicto.configure(fg_color=fondo)
+        self.label_veredicto.configure(text=texto, text_color=tinte)
+
+    def _cambiar_rotacion(self, seleccion):
+        self.rotacion_actual = seleccion
+
+    def _cambiar_modo_direccion(self, seleccion):
+
+        if seleccion == "Ultimo numero":
+            self.entry_ip_completa.pack_forget()
+            self.frame_ip_corta.pack(fill="x")
+        else:
+            self.frame_ip_corta.pack_forget()
+            self.entry_ip_completa.pack(fill="x")
 
     def _cambiar_tipo_camara(self, seleccion):
 
-        if seleccion == "PC (webcam)":
+        if seleccion == "Esta PC":
             self.frame_fuente_celular.pack_forget()
             self.frame_fuente_pc.pack(fill="x")
         else:
@@ -654,12 +789,15 @@ class PoseApp(ctk.CTk):
 
     def _obtener_fuente(self):
 
-        if self.tipo_camara.get() == "PC (webcam)":
+        if self.tipo_camara.get() == "Esta PC":
             texto = self.entry_indice_pc.get().strip()
             return int(texto) if texto.isdigit() else 0
 
-        ultimo_numero = self.entry_ip_final.get().strip()
-        return f"http://{PREFIJO_IP_CELULAR}{ultimo_numero}:{PUERTO_IP_WEBCAM}/video"
+        if self.modo_direccion.get() == "Ultimo numero":
+            ultimo = self.entry_ip_final.get().strip()
+            return f"http://{PREFIJO_IP_CELULAR}{ultimo}:{PUERTO_IP_WEBCAM}/video"
+
+        return completar_direccion(self.entry_ip_completa.get())
 
     def iniciar(self):
 
@@ -668,10 +806,23 @@ class PoseApp(ctk.CTk):
 
         fuente = self._obtener_fuente()
 
+        if fuente == "":
+            self._set_estado(
+                "Escribe la direccion del celular antes de empezar.",
+                COLOR["alerta"],
+            )
+            return
+
         self.cap = LectorCamara(fuente)
 
         if not self.cap.abierto():
-            self._set_estado(f"No se pudo abrir: {fuente}", COLOR["peligro"])
+            # El error dice que hacer, no solo que fallo.
+            if self.tipo_camara.get() == "Esta PC":
+                aviso = f"No hay camara en el indice {fuente}. Prueba con 1."
+            else:
+                aviso = "El celular no responde. Revisa que IP Webcam este abierto y en la misma red."
+
+            self._set_estado(aviso, COLOR["alerta"])
             self.cap = None
             return
 
@@ -686,23 +837,41 @@ class PoseApp(ctk.CTk):
             min_pose_detection_confidence=0.5,
             min_pose_presence_confidence=0.5,
             min_tracking_confidence=0.5,
-            output_segmentation_masks=USE_SEGMENTATION,
         )
 
         self.detector = vision.PoseLandmarker.create_from_options(options)
 
         self.start_time = time.time()
         self.previous_time = time.time()
+        self.senal_perdida = False
+        self.ultima_salida = None
+        self.rotacion_actual = self.combo_rotacion.get()
 
         self.corriendo = True
-        self._set_estado("Corriendo", COLOR["exito"])
+        self.hilo_proceso = threading.Thread(
+            target=self._bucle_proceso, daemon=True
+        )
+        self.hilo_proceso.start()
+
+        self._set_estado("Midiendo")
+        self._set_veredicto(
+            "Buscando", COLOR["filete"], COLOR["tenue"]
+        )
         self._actualizar_botones()
 
-        self._actualizar_frame()
+        self._pintar()
 
     def detener(self):
 
         self.corriendo = False
+
+        # Se espera al hilo antes de soltar camara y detector: si no,
+        # podria seguir usandolos justo despues de cerrarlos.
+        if self.hilo_proceso is not None:
+            self.hilo_proceso.join(timeout=1.0)
+            self.hilo_proceso = None
+
+        self.imagen_tk = None
 
         if self.cap is not None:
             self.cap.detener()
@@ -713,16 +882,16 @@ class PoseApp(ctk.CTk):
             self.detector = None
 
         self._reiniciar_valores()
-        self._set_estado("Detenido", COLOR["texto_tenue"])
+        self._set_estado("Detenido")
         self._actualizar_botones()
 
     def _reiniciar_valores(self):
         """Al detener, los ultimos numeros dejan de ser ciertos."""
-        for valor_label in self.valores.values():
-            valor_label.configure(text="--")
+        for clave, valor_label in self.valores.items():
+            valor_label.configure(text="" if clave == "fps" else "—")
 
-        self.label_postura.configure(
-            text="--", text_color=COLOR["texto_tenue"]
+        self._set_veredicto(
+            "Sin lectura", COLOR["filete"], COLOR["tenue"]
         )
 
     def on_closing(self):
@@ -733,170 +902,212 @@ class PoseApp(ctk.CTk):
     # Bucle principal (dirigido por eventos, no bloqueante)
     # ---------------------------------
 
-    def _actualizar_frame(self):
+    # ---------------------------------
+    # Procesado (hilo aparte) y pintado (hilo de la interfaz)
+    # ---------------------------------
 
+    def _bucle_proceso(self):
+        """Captura e inferencia, fuera del hilo de la interfaz.
+
+        Antes esto corria dentro de un after() de Tk: cada frame
+        bloqueaba la ventana ~17 ms de MediaPipe mas ~16 ms de pintado,
+        y cualquier tropiezo de la red congelaba la interfaz entera.
+        Eso eran los tirones. Aqui el hilo solo toca numpy, OpenCV y
+        MediaPipe; Tk se queda para el hilo principal, que es lo unico
+        que Tk admite.
+        """
+        while self.corriendo:
+            ok, frame_bgr = self.cap.leer()
+
+            if not self.cap.corriendo:
+                self.senal_perdida = True
+                return
+
+            if not ok:
+                time.sleep(0.002)
+                continue
+
+            rotacion = ROTACIONES[self.rotacion_actual]
+
+            if rotacion is not None:
+                frame_bgr = cv2.rotate(frame_bgr, rotacion)
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                data=frame_rgb)
+            timestamp_ms = int((time.time() - self.start_time) * 1000)
+
+            try:
+                result = self.detector.detect_for_video(mp_image, timestamp_ms)
+            except Exception:
+                # Un timestamp repetido o un frame corrupto no deben
+                # tumbar el hilo: se descarta y se sigue.
+                continue
+
+            salida, medidas = self._procesar(frame_bgr, result)
+
+            ahora = time.time()
+            self.fps_medido = 1.0 / max(1e-6, ahora - self.previous_time)
+            self.previous_time = ahora
+
+            with self.candado_salida:
+                self.ultima_salida = (salida, medidas)
+
+    def _procesar(self, output, result):
+        """Dibuja el skeleton y calcula las medidas. Sin tocar Tk."""
+        medidas = {}
+
+        if not result.pose_landmarks:
+            return output, medidas
+
+        pose_landmarks = result.pose_landmarks[0]
+        height, width = output.shape[:2]
+
+        # El skeleton se dibuja sobre el frame original y luego ese
+        # frame se escala para mostrarlo. Si el grosor fuera fijo, a
+        # baja resolucion las lineas se verian gordisimas al ampliar.
+        escala_dibujo = min(width, height) / 480.0
+        grosor_linea = max(1, round(2 * escala_dibujo))
+        radio_punto = max(1, round(3 * escala_dibujo))
+
+        points = [None] * len(pose_landmarks)
+
+        for index, landmark in enumerate(pose_landmarks):
+            x = max(0, min(width - 1, int(landmark.x * width)))
+            y = max(0, min(height - 1, int(landmark.y * height)))
+            points[index] = (x, y)
+            cv2.circle(output, (x, y), radio_punto, BGR_SKELETON, -1)
+
+        for start, end in POSE_CONNECTIONS:
+            if (
+                start < len(points) and end < len(points)
+                and points[start] is not None and points[end] is not None
+            ):
+                cv2.line(
+                    output, points[start], points[end],
+                    BGR_SKELETON, grosor_linea,
+                )
+
+        necesarios_piernas = [HOMBRO_D, CADERA_D, RODILLA_D, TOBILLO_D]
+
+        if all(points[i] is not None for i in necesarios_piernas):
+            medidas["rodilla"] = calcular_angulo(
+                points[CADERA_D], points[RODILLA_D], points[TOBILLO_D]
+            )
+            medidas["cadera"] = calcular_angulo(
+                points[HOMBRO_D], points[CADERA_D], points[RODILLA_D]
+            )
+
+        necesarios_espalda = [HOMBRO_I, HOMBRO_D, CADERA_I, CADERA_D, OREJA_D]
+
+        if all(points[i] is not None for i in necesarios_espalda):
+            hombro_medio = punto_medio(points[HOMBRO_I], points[HOMBRO_D])
+            cadera_medio = punto_medio(points[CADERA_I], points[CADERA_D])
+
+            medidas["inclinacion"] = angulo_respecto_vertical(
+                cadera_medio, hombro_medio
+            )
+            medidas["joroba"] = indice_encorvamiento(
+                points[OREJA_D], hombro_medio, cadera_medio
+            )
+
+            cv2.line(
+                output,
+                (int(cadera_medio[0]), int(cadera_medio[1])),
+                (int(hombro_medio[0]), int(hombro_medio[1])),
+                BGR_TRONCO, grosor_linea,
+            )
+
+        return output, medidas
+
+    def _pintar(self):
+        """Pinta el ultimo resultado disponible. Hilo de la interfaz."""
         if not self.corriendo:
             return
 
-        if not self.cap.corriendo:
-            # El mensaje va despues de detener(), que reescribe el
-            # estado a "Detenido" y si no borraria el aviso al instante.
+        if self.senal_perdida:
             self.detener()
-            self._set_estado("Se perdio la senal de camara", COLOR["peligro"])
+            self._set_estado("Se corto la senal de la camara", COLOR["alerta"])
             return
 
-        ok, frame_bgr = self.cap.leer()
+        with self.candado_salida:
+            paquete = self.ultima_salida
+            self.ultima_salida = None
 
-        # Todavia no hay frame nuevo: no es un error, solo se reintenta
-        # en el proximo ciclo sin procesar nada.
-        if not ok:
-            self.after(5, self._actualizar_frame)
+        # Sin frame nuevo no se repinta: reprocesar el mismo no aporta
+        # nada y solo gasta el hilo de la interfaz.
+        if paquete is None:
+            self.after(5, self._pintar)
             return
 
-        rotacion = ROTACIONES[self.combo_rotacion.get()]
+        salida, medidas = paquete
 
-        if rotacion is not None:
-            frame_bgr = cv2.rotate(frame_bgr, rotacion)
+        self._mostrar_medidas(medidas)
+        self._mostrar_frame(salida)
 
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        self.after(MS_ENTRE_PINTADOS, self._pintar)
 
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-
-        timestamp_ms = int((time.time() - self.start_time) * 1000)
-
-        result = self.detector.detect_for_video(mp_image, timestamp_ms)
-
-        output = frame_bgr.copy()
-
-        # --- Segmentacion ---
-
-        if USE_SEGMENTATION and result.segmentation_masks:
-
-            mask = np.squeeze(result.segmentation_masks[0].numpy_view())
-            mask3 = np.repeat(mask[:, :, None], 3, axis=2)
-
-            fondo_gris = cv2.cvtColor(
-                cv2.cvtColor(output, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR
+    def _mostrar_medidas(self, medidas):
+        if "rodilla" in medidas:
+            self.valores["rodilla"].configure(
+                text=f"{medidas['rodilla']:.0f}°"
+            )
+            self.valores["cadera"].configure(
+                text=f"{medidas['cadera']:.0f}°"
             )
 
-            output = np.where(mask3 > MASK_THRESH, output, fondo_gris)
+        if "joroba" in medidas:
+            postura, hay_alerta = clasificar_postura(
+                medidas["inclinacion"], medidas["joroba"], self.alerta_previa
+            )
+            self.alerta_previa = hay_alerta
 
-        # --- Landmarks + calculo de variables (sin dibujar texto) ---
+            self.valores["inclinacion"].configure(
+                text=f"{medidas['inclinacion']:.0f}°"
+            )
+            self.valores["joroba"].configure(text=f"{medidas['joroba']:.2f}")
 
-        if result.pose_landmarks:
+            # El texto ya distingue los casos por si solo; el campo de
+            # color es lo que se ve a tres metros.
+            self._set_veredicto(
+                postura,
+                COLOR["alerta"] if hay_alerta else COLOR["correcto"],
+                COLOR["sobre_campo"],
+            )
 
-            pose_landmarks = result.pose_landmarks[0]
-            height, width = output.shape[:2]
+        self.valores["fps"].configure(text=f"{self.fps_medido:.0f} fps")
 
-            # El skeleton se dibuja sobre el frame original y luego ese
-            # frame se escala para mostrarlo. Si el grosor fuera fijo, a
-            # baja resolucion las lineas se verian gordisimas al ampliar.
-            escala_dibujo = min(width, height) / 480.0
-            grosor_linea = max(1, round(2 * escala_dibujo))
-            radio_punto = max(1, round(3 * escala_dibujo))
-
-            points = [None] * len(pose_landmarks)
-
-            for index, landmark in enumerate(pose_landmarks):
-                x = max(0, min(width - 1, int(landmark.x * width)))
-                y = max(0, min(height - 1, int(landmark.y * height)))
-                points[index] = (x, y)
-                cv2.circle(output, (x, y), radio_punto, BGR_SKELETON, -1)
-
-            for start, end in POSE_CONNECTIONS:
-                if (
-                    start < len(points) and end < len(points)
-                    and points[start] is not None and points[end] is not None
-                ):
-                    cv2.line(
-                        output, points[start], points[end],
-                        BGR_SKELETON, grosor_linea,
-                    )
-
-            necesarios_piernas = [HOMBRO_D, CADERA_D, RODILLA_D, TOBILLO_D]
-
-            if all(points[i] is not None for i in necesarios_piernas):
-
-                angulo_rodilla = calcular_angulo(
-                    points[CADERA_D], points[RODILLA_D], points[TOBILLO_D]
-                )
-                angulo_cadera = calcular_angulo(
-                    points[HOMBRO_D], points[CADERA_D], points[RODILLA_D]
-                )
-
-                # La unidad va en su propia etiqueta dentro de la
-                # tarjeta, aqui solo la cifra.
-                self.valores["rodilla"].configure(text=f"{angulo_rodilla:.0f}")
-                self.valores["cadera"].configure(text=f"{angulo_cadera:.0f}")
-
-            necesarios_espalda = [HOMBRO_I, HOMBRO_D, CADERA_I, CADERA_D, OREJA_D]
-
-            if all(points[i] is not None for i in necesarios_espalda):
-
-                hombro_medio = punto_medio(points[HOMBRO_I], points[HOMBRO_D])
-                cadera_medio = punto_medio(points[CADERA_I], points[CADERA_D])
-
-                angulo_inclinacion = angulo_respecto_vertical(
-                    cadera_medio, hombro_medio
-                )
-                indice_joroba = indice_encorvamiento(
-                    points[OREJA_D], hombro_medio, cadera_medio
-                )
-
-                postura, hay_alerta = clasificar_postura(
-                    angulo_inclinacion, indice_joroba
-                )
-
-                self.valores["inclinacion"].configure(
-                    text=f"{angulo_inclinacion:.1f}"
-                )
-                self.valores["joroba"].configure(text=f"{indice_joroba:.2f}")
-
-                # El texto ya distingue los casos; el color solo lo
-                # refuerza, no es el unico canal.
-                self.label_postura.configure(
-                    text=postura,
-                    text_color=(
-                        COLOR["peligro"] if hay_alerta else COLOR["exito"]
-                    ),
-                )
-
-                cv2.line(
-                    output,
-                    (int(cadera_medio[0]), int(cadera_medio[1])),
-                    (int(hombro_medio[0]), int(hombro_medio[1])),
-                    BGR_TRONCO, grosor_linea,
-                )
-
-        # --- FPS ---
-
-        current_time = time.time()
-        fps = 1.0 / max(1e-6, current_time - self.previous_time)
-        self.previous_time = current_time
-
-        self.valores["fps"].configure(text=f"{fps:.1f}")
-
-        # --- Mostrar frame en la interfaz ---
-        # Escalar para ocupar el espacio disponible del panel de
-        # video (sea vertical u horizontal), sin deformar la imagen.
-
+    def _mostrar_frame(self, output):
         alto, ancho = output.shape[:2]
         caja_ancho, caja_alto = self._video_box
 
         if caja_ancho > 10 and caja_alto > 10 and alto > 0 and ancho > 0:
-            escala = min(caja_ancho / ancho, caja_alto / alto)
+            # Sin pasar de ANCHO_MAX_VIDEO: ampliar mas no anade
+            # detalle (el frame no lo tiene) y el coste de subirlo a Tk
+            # crece con el area. A 1000 px de ancho eran 15 ms por
+            # frame; a 960 con paste son unos 8.
+            escala = min(caja_ancho / ancho, caja_alto / alto,
+                         ANCHO_MAX_VIDEO / ancho)
             nuevo_ancho = max(1, int(ancho * escala))
             nuevo_alto = max(1, int(alto * escala))
-            output = cv2.resize(output, (nuevo_ancho, nuevo_alto))
 
-        imagen_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
-        imagen_pil = Image.fromarray(imagen_rgb)
-        imagen_tk = ImageTk.PhotoImage(image=imagen_pil)
+            if (nuevo_ancho, nuevo_alto) != (ancho, alto):
+                output = cv2.resize(output, (nuevo_ancho, nuevo_alto))
 
-        self.label_video.configure(image=imagen_tk)
-        self.label_video.image = imagen_tk  # evitar garbage collection
+        imagen_pil = Image.fromarray(cv2.cvtColor(output, cv2.COLOR_BGR2RGB))
 
-        self.after(15, self._actualizar_frame)
+        # Reutilizar el PhotoImage con paste() en vez de crear uno
+        # nuevo cada frame: crearlo costaba 15 ms, pegarlo cuesta 8.
+        # Solo se recrea cuando cambia el tamano.
+        if (self.imagen_tk is None
+                or self.imagen_tk.width() != imagen_pil.width
+                or self.imagen_tk.height() != imagen_pil.height):
+            self.imagen_tk = ImageTk.PhotoImage(image=imagen_pil)
+            self.label_video.configure(image=self.imagen_tk)
+        else:
+            self.imagen_tk.paste(imagen_pil)
+
+        self.label_video.image = self.imagen_tk
 
 
 # =================================
