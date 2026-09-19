@@ -1,0 +1,22 @@
+# Entorno virtual (355 MB, se recrea con pip install)
+.venv/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Modelos de MediaPipe (13 MB, se descargan de nuevo desde Google)
+# Si prefieres versionarlos para que el repo sea autocontenido,
+# borra esta linea y usa Git LFS.
+models/
+
+# Sistema operativo
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editores
+.vscode/
+.idea/
+*.swp

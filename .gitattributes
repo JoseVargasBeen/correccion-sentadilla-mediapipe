@@ -1,0 +1,10 @@
+# Normaliza los finales de linea del codigo a LF dentro del repo.
+* text=auto
+
+# Binarios: Git no debe tocarles los finales de linea. Sin esto,
+# core.autocrlf los reescribe al hacer checkout y los corrompe.
+*.pdf binary
+*.task binary
+*.png binary
+*.jpg binary
+*.mp4 binary
