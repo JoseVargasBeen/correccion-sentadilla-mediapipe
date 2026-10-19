@@ -603,41 +603,55 @@ class PerfilCorporal:
     def deteccion_coherente(self, puntos):
         """Descarta frames donde los landmarks se fueron.
 
-        Las proporciones de una persona no cambian: si un hueso mide
-        de pronto la mitad o el doble que en la referencia, lo que
-        fallo es la deteccion, no el cuerpo. Sirve para no alimentar
-        el analisis con basura.
+        Compara RAZONES entre huesos (femur contra tibia), no
+        longitudes. Una razon no tiene escala: no cambia al acercarse
+        a la camara ni al girarse, asi que no hace falta elegir un
+        segmento como patron.
+
+        Esto no es un detalle de estilo. La version anterior
+        normalizaba por el ancho de caderas, y eso solo vale de
+        frente: de perfil las dos caderas se proyectan casi en el
+        mismo pixel, el ancho medido pasa de 50 px a 2, y cualquier
+        temblor de un pixel se vuelve un error del 50%. Con la camara
+        de lado, que es como quedo decidido grabar, aquella version
+        rechazaba todos los fotogramas.
         """
 
-        # Se normaliza por el ancho de caderas para que acercarse o
-        # alejarse de la camara no cuente como incoherencia.
-        caderas_ref = self.segmentos_px.get("ancho_caderas", 0.0)
-        caderas_ahora = distancia(puntos[CADERA_I], puntos[CADERA_D])
-
-        if caderas_ref < 1e-6 or caderas_ahora < 1e-6:
-            return False
-
-        escala = caderas_ahora / caderas_ref
-
-        # Cada lado se mide por separado, no promediado: con el
-        # promedio, una pierna disparatada se compensaba con la buena
-        # y el frame pasaba el filtro.
-        pares = (
-            ("femur", (CADERA_I, RODILLA_I), (CADERA_D, RODILLA_D)),
-            ("tibia", (RODILLA_I, TOBILLO_I), (RODILLA_D, TOBILLO_D)),
+        # Cada lado va por separado, sin promediar: un hombro perdido
+        # solo corre el punto medio a la mitad, y el promedio lo
+        # disimulaba lo justo para colarse por el filtro.
+        comparaciones = (
+            ("femur", "tibia",
+             (puntos[CADERA_I], puntos[RODILLA_I]),
+             (puntos[RODILLA_I], puntos[TOBILLO_I])),
+            ("femur", "tibia",
+             (puntos[CADERA_D], puntos[RODILLA_D]),
+             (puntos[RODILLA_D], puntos[TOBILLO_D])),
+            ("tronco", "femur",
+             (puntos[HOMBRO_I], puntos[CADERA_I]),
+             (puntos[CADERA_I], puntos[RODILLA_I])),
+            ("tronco", "femur",
+             (puntos[HOMBRO_D], puntos[CADERA_D]),
+             (puntos[CADERA_D], puntos[RODILLA_D])),
         )
 
-        for nombre, izquierdo, derecho in pares:
-            referencia = self.segmentos_px.get(nombre, 0.0) * escala
+        for arriba, abajo, par_a, par_b in comparaciones:
+            esperada_a = self.segmentos_px.get(arriba, 0.0)
+            esperada_b = self.segmentos_px.get(abajo, 0.0)
 
-            if referencia < 1e-6:
+            if esperada_a < 1e-6 or esperada_b < 1e-6:
                 continue
 
-            for a, b in (izquierdo, derecho):
-                factor = distancia(puntos[a], puntos[b]) / referencia
+            largo_a = distancia(*par_a)
+            largo_b = distancia(*par_b)
 
-                if not (FACTOR_MIN_SANO <= factor <= FACTOR_MAX_SANO):
-                    return False
+            if largo_b < 1e-6:
+                return False
+
+            factor = (largo_a / largo_b) / (esperada_a / esperada_b)
+
+            if not (FACTOR_MIN_SANO <= factor <= FACTOR_MAX_SANO):
+                return False
 
         return True
 
