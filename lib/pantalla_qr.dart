@@ -32,9 +32,14 @@ abstract final class PuntoDeAcceso {
   static String? clave;
   static String? ip;
 
+  /// IP del ultimo punto de acceso apagado. Se recuerda para no
+  /// volver a anunciarla mientras Android termina de retirarla.
+  static String? ipRetirada;
+
   static bool get activo => ssid != null;
 
   static void limpiar() {
+    ipRetirada = ip;
     ssid = null;
     clave = null;
     ip = null;
@@ -68,7 +73,13 @@ class _PantallaQrState extends State<PantallaQr> {
 
   bool get _puntoDeAccesoActivo => _ssid != null;
 
-  String? get _ipActual => _ipPuntoDeAcceso ?? widget.direccionIp;
+  /// Direccion en la WiFi normal. Empieza con la que paso la pantalla
+  /// principal, pero se vuelve a buscar al apagar el punto de acceso:
+  /// la que llego al abrir podia ser la del propio punto de acceso, y
+  /// tras apagarlo el QR seguia anunciando una red que ya no existia.
+  late String? _ipLocal = PuntoDeAcceso.activo ? null : widget.direccionIp;
+
+  String? get _ipActual => _ipPuntoDeAcceso ?? _ipLocal;
 
   String? get _contenidoQr {
     final ip = _ipActual;
@@ -95,8 +106,10 @@ class _PantallaQrState extends State<PantallaQr> {
         await ConversorNativo.cerrarPuntoDeAcceso();
         PuntoDeAcceso.limpiar();
 
+        final ip = await buscarIpLocal(excepto: PuntoDeAcceso.ipRetirada);
+
         if (!mounted) return;
-        setState(() {});
+        setState(() => _ipLocal = ip);
       } else {
         // Foto de las interfaces ANTES de crear la red, para despues
         // reconocer cual apareció.
@@ -117,6 +130,7 @@ class _PantallaQrState extends State<PantallaQr> {
           return;
         }
 
+        PuntoDeAcceso.ipRetirada = null;
         PuntoDeAcceso.ssid = credenciales.ssid;
         PuntoDeAcceso.clave = credenciales.clave;
         PuntoDeAcceso.ip = ip;

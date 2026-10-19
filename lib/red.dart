@@ -37,12 +37,19 @@ Future<Map<String, String>> direccionesPorInterfaz() async {
 }
 
 /// Direccion del telefono dentro de la red local (WiFi normal).
-Future<String?> buscarIpLocal() async {
+///
+/// [excepto] descarta una direccion concreta. Hace falta justo despues
+/// de apagar el punto de acceso: Android tarda unos cientos de
+/// milisegundos en desmontar la interfaz, y en ese intervalo su IP
+/// sigue apareciendo aunque la red ya no exista.
+Future<String?> buscarIpLocal({String? excepto}) async {
   final direcciones = await direccionesPorInterfaz();
 
-  if (direcciones.isEmpty) return null;
+  for (final ip in direcciones.values) {
+    if (ip != excepto) return ip;
+  }
 
-  return direcciones.values.first;
+  return null;
 }
 
 /// Direccion del punto de acceso recien creado.

@@ -124,10 +124,14 @@ class _PantallaCamaraState extends State<PantallaCamara> {
   Future<void> _buscarIpLocal() async {
     // Con el punto de acceso encendido hay dos redes y la que importa
     // es la del celular: es donde esta el PC.
-    final ip = PuntoDeAcceso.ip ?? await buscarIpLocal();
+    final ip =
+        PuntoDeAcceso.ip ??
+        await buscarIpLocal(excepto: PuntoDeAcceso.ipRetirada);
 
-    if (!mounted || ip == null) return;
+    if (!mounted) return;
 
+    // Tambien cuando no hay IP: dejar la anterior mostraria una
+    // direccion muerta, por ejemplo la del punto de acceso ya apagado.
     setState(() => _direccionIp = ip);
   }
 
