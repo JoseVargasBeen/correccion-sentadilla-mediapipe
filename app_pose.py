@@ -33,6 +33,7 @@ Requiere: opencv-python, mediapipe, numpy, customtkinter, pillow
 """
 
 import math
+import os
 import threading
 import time
 import tkinter.font as tkfont
@@ -574,10 +575,38 @@ def clasificar_postura(angulo_inclinacion, indice_joroba,
 # Aplicacion
 # =================================
 
+# Mismo icono que Camcel; ambos salen de generar_icono.py.
+RUTA_ICONO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icono.ico")
+
+
+def _identificar_app_en_windows():
+    """Hace que la barra de tareas muestre el icono propio.
+
+    Sin esto Windows agrupa la ventana bajo python.exe y en la barra
+    aparece la serpiente de Python aunque la ventana tenga su icono.
+    Debe ir antes de crear la ventana.
+    """
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "josed.semillero.correccion-pose"
+        )
+    except (AttributeError, OSError):
+        # No es Windows, o la API no esta: se sigue con el icono comun.
+        pass
+
+
 class PoseApp(ctk.CTk):
 
     def __init__(self):
+        _identificar_app_en_windows()
         super().__init__()
+
+        # CustomTkinter pone su propio icono unos milisegundos despues
+        # de crear la ventana, salvo que ya se haya llamado a
+        # iconbitmap. Por eso va aqui, nada mas crearla.
+        if os.path.exists(RUTA_ICONO):
+            self.iconbitmap(RUTA_ICONO)
 
         self.title("Correccion de ejercicio - Prototipo PC")
         self.geometry("1100x700")
