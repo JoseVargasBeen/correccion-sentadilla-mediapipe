@@ -816,6 +816,17 @@ class ReconstructorPierna:
     un solo fotograma no da: una segunda camara, o un modelo del
     cuerpo entero que resuelva todas las articulaciones a la vez en
     lugar de hueso por hueso.
+
+    Se midio tambien si un laser de distancia apuntando a los pies
+    arregla el ancla, que era el eslabon mas sospechoso. No basta:
+    con el ancla medida en vez de reconstruida, el error medio del
+    angulo de rodilla sigue en 7 grados sin ruido de imagen y en 18
+    con un pixel. El laser quita la incertidumbre del tobillo, pero
+    la ambiguedad vive en la rodilla, y ahi no mira ningun sensor.
+
+    Para las piernas la solucion barata no es un sensor sino un
+    angulo: de perfil, la flexion de rodilla se mide en 2D y no hace
+    falta reconstruir nada.
     """
 
     def __init__(self, perfil, ancho_imagen, alto_imagen,
