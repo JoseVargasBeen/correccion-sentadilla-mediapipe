@@ -20,6 +20,27 @@ import 'tema.dart';
 /// - Punto de acceso del celular:
 ///   {"ip": "...", "puerto": 8080, "ssid": "...", "clave": "..."}
 ///   El PC primero entra a esa red y despues se conecta.
+/// Estado del punto de acceso, fuera de la pantalla.
+///
+/// Antes vivia en el State de PantallaQr y moria al salir de ella,
+/// mientras la red seguia encendida en Android. Al volver, la pantalla
+/// ofrecia "Crear punto de acceso" sobre una red ya creada (y Android
+/// respondia que ya estaba abierta), y la principal seguia mostrando
+/// la IP de la WiFi de casa, inutil para un PC conectado al celular.
+abstract final class PuntoDeAcceso {
+  static String? ssid;
+  static String? clave;
+  static String? ip;
+
+  static bool get activo => ssid != null;
+
+  static void limpiar() {
+    ssid = null;
+    clave = null;
+    ip = null;
+  }
+}
+
 class PantallaQr extends StatefulWidget {
   const PantallaQr({
     super.key,
@@ -36,13 +57,14 @@ class PantallaQr extends StatefulWidget {
 
 class _PantallaQrState extends State<PantallaQr> {
   bool _ocupado = false;
-  String? _ssid;
-  String? _clave;
   String? _error;
 
-  /// La IP cambia al encender el punto de acceso: el celular deja la
-  /// WiFi y pasa a ser el router de su propia red.
-  String? _ipPuntoDeAcceso;
+  String? get _ssid => PuntoDeAcceso.ssid;
+  String? get _clave => PuntoDeAcceso.clave;
+
+  /// Con el punto de acceso encendido, el celular es el router de su
+  /// propia red y tiene ahi otra direccion.
+  String? get _ipPuntoDeAcceso => PuntoDeAcceso.ip;
 
   bool get _puntoDeAccesoActivo => _ssid != null;
 
@@ -71,13 +93,10 @@ class _PantallaQrState extends State<PantallaQr> {
     try {
       if (_puntoDeAccesoActivo) {
         await ConversorNativo.cerrarPuntoDeAcceso();
+        PuntoDeAcceso.limpiar();
 
         if (!mounted) return;
-        setState(() {
-          _ssid = null;
-          _clave = null;
-          _ipPuntoDeAcceso = null;
-        });
+        setState(() {});
       } else {
         // Foto de las interfaces ANTES de crear la red, para despues
         // reconocer cual apareció.
@@ -98,11 +117,11 @@ class _PantallaQrState extends State<PantallaQr> {
           return;
         }
 
-        setState(() {
-          _ssid = credenciales.ssid;
-          _clave = credenciales.clave;
-          _ipPuntoDeAcceso = ip;
-        });
+        PuntoDeAcceso.ssid = credenciales.ssid;
+        PuntoDeAcceso.clave = credenciales.clave;
+        PuntoDeAcceso.ip = ip;
+
+        setState(() {});
       }
     } on PlatformException catch (e) {
       if (!mounted) return;
