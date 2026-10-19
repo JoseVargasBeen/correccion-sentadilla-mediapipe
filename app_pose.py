@@ -16,6 +16,19 @@ CALCULO de la VISUALIZACION:
 Este es un prototipo desechable para probar la logica y mostrar
 avances; la version final para el usuario sera en Flutter (Fase 5).
 
+LA CAMARA VA DE PERFIL
+----------------------
+Quedo decidido por medida, no por gusto. De perfil, la flexion de
+rodilla es geometria plana y sale exacta, y el encorvamiento se ve
+como lo que es: la cabeza adelantandose respecto al tronco.
+
+De frente las dos cosas ocurren hacia la camara, que es la direccion
+que una sola camara no mide. Se intento recuperar esa profundidad a
+partir de las proporciones del cuerpo (ver perfil_corporal.py): la
+geometria sale exacta sobre datos perfectos y se derrumba con medio
+pixel de ruido, porque el problema esta mal condicionado justo con el
+cuerpo erguido, que es como empieza todo movimiento.
+
 Requiere: opencv-python, mediapipe, numpy, customtkinter, pillow
 """
 
@@ -31,6 +44,8 @@ import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
 import conexion_qr
+from conteo_sentadillas import ContadorSentadillas
+from perfil_corporal import PerfilCorporal
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -265,6 +280,10 @@ UMBRAL_JOROBA = 0.08
 # color parpadea. Con margen, encender cuesta mas que apagar.
 MARGEN_JOROBA = 0.02
 MARGEN_INCLINACION = 3.0
+
+# Fotogramas que se promedian al medir el perfil. Con uno solo, el
+# temblor de los landmarks quedaria grabado como si fuera la medida.
+CAPTURAS_PARA_PERFIL = 30
 
 
 # =================================
@@ -564,6 +583,21 @@ class PoseApp(ctk.CTk):
         self.giro_grados = 0
         self.rotacion_actual = None
 
+        # Cuenta y juzga las repeticiones. Vive en el hilo de la
+        # interfaz porque necesita la alerta de postura, que se decide
+        # al mostrar las medidas, y es calculo de cuatro comparaciones.
+        self.contador = ContadorSentadillas()
+
+        # Perfil de la persona, si ya se midio en otra sesion. Sirve
+        # para descartar fotogramas donde los landmarks se fueron.
+        self.perfil = PerfilCorporal.cargar()
+
+        # Mientras esto tenga una lista, el hilo de proceso va
+        # guardando capturas para construir el perfil.
+        self.capturas_perfil = None
+        self.estatura_pedida = 170.0
+        self.frames_descartados = 0
+
         # Lectura del QR y red a la que volver despues: la del celular
         # no comparte internet, asi que no conviene quedarse ahi.
         self.escaner = None
@@ -810,6 +844,36 @@ class PoseApp(ctk.CTk):
         )
         self.label_giro.grid(row=0, column=2, padx=(ESPACIO["sm"], 0))
 
+        self._etiqueta_control(controles, 3, "Estatura")
+
+        perfil_fila = ctk.CTkFrame(controles, fg_color="transparent")
+        perfil_fila.grid(row=3, column=1, sticky="ew", pady=ESPACIO["xs"])
+
+        self.entry_estatura = ctk.CTkEntry(
+            perfil_fila, width=58, font=self.fuente_texto, corner_radius=0,
+            fg_color=COLOR["campo"], border_color=COLOR["filete"],
+            text_color=COLOR["texto"], border_width=1,
+        )
+        self.entry_estatura.insert(
+            0, f"{self.perfil.estatura_cm:.0f}" if self.perfil else "170"
+        )
+        self.entry_estatura.pack(side="left")
+
+        ctk.CTkLabel(
+            perfil_fila, text="cm", font=self.fuente_texto,
+            text_color=COLOR["tenue"],
+        ).pack(side="left", padx=ESPACIO["xs"])
+
+        self.boton_perfil = ctk.CTkButton(
+            perfil_fila, text="Medir perfil", command=self._medir_perfil,
+            height=28, font=self.fuente_texto, corner_radius=0,
+            fg_color="transparent", hover_color=COLOR["campo"],
+            border_width=1, border_color=COLOR["filete"],
+            text_color=COLOR["texto"],
+            text_color_disabled=COLOR["filete"],
+        )
+        self.boton_perfil.pack(side="left", padx=(ESPACIO["sm"], 0))
+
         botones = ctk.CTkFrame(panel, fg_color="transparent")
         botones.grid(row=1, column=0, sticky="ew",
                      padx=ESPACIO["lg"], pady=ESPACIO["md"])
@@ -867,6 +931,7 @@ class PoseApp(ctk.CTk):
         self.valores = {}
 
         filas = [
+            ("repeticiones", "Repeticiones"),
             ("rodilla", "Rodilla"),
             ("cadera", "Cadera"),
             ("inclinacion", "Tronco"),
@@ -1250,6 +1315,7 @@ class PoseApp(ctk.CTk):
         self.motivo_corte = None
         self.midiendo = False
         self.ultima_salida = None
+        self.contador.reiniciar()
 
         self.corriendo = True
         self.sesion += 1
@@ -1316,7 +1382,16 @@ class PoseApp(ctk.CTk):
     def _reiniciar_valores(self):
         """Al detener, los ultimos numeros dejan de ser ciertos."""
         for clave, valor_label in self.valores.items():
-            valor_label.configure(text="" if clave == "fps" else "—")
+            if clave == "fps":
+                texto = ""
+            elif clave == "repeticiones":
+                # Las repeticiones hechas si siguen siendo ciertas: es
+                # el resultado de la serie, no una lectura en vivo.
+                texto = str(self.contador.repeticiones)
+            else:
+                texto = "—"
+
+            valor_label.configure(text=texto)
 
         self._set_veredicto(
             "Sin lectura", COLOR["filete"], COLOR["tenue"]
@@ -1454,6 +1529,19 @@ class PoseApp(ctk.CTk):
                     BGR_SKELETON, grosor_linea,
                 )
 
+        if self.capturas_perfil is not None:
+            self.capturas_perfil.append(list(points))
+
+        # Un fotograma con un hueso del doble de largo no es una
+        # postura rara, es una deteccion perdida: medirla ensucia
+        # todo lo que viene detras.
+        if (
+            self.perfil is not None
+            and not self.perfil.deteccion_coherente(points)
+        ):
+            self.frames_descartados += 1
+            return output, medidas
+
         necesarios_piernas = [HOMBRO_D, CADERA_D, RODILLA_D, TOBILLO_D]
 
         if all(points[i] is not None for i in necesarios_piernas):
@@ -1519,6 +1607,8 @@ class PoseApp(ctk.CTk):
         self.after(MS_ENTRE_PINTADOS, lambda: self._pintar(sesion))
 
     def _mostrar_medidas(self, medidas):
+        hay_alerta = self.alerta_previa
+
         if "rodilla" in medidas:
             self.valores["rodilla"].configure(
                 text=f"{medidas['rodilla']:.0f}°"
@@ -1545,6 +1635,102 @@ class PoseApp(ctk.CTk):
                 COLOR["alerta"] if hay_alerta else COLOR["correcto"],
                 COLOR["sobre_campo"],
             )
+
+        self._contar_repeticion(medidas.get("rodilla"), hay_alerta)
+
+    # ---------------------------------
+    # Perfil corporal
+    # ---------------------------------
+
+    def _medir_perfil(self):
+        """Toma las proporciones de la persona, de pie y quieta.
+
+        Hace falta la medicion en marcha: lo que se mide son los
+        landmarks que ya esta produciendo el hilo de proceso.
+        """
+
+        if not self.corriendo:
+            self._set_estado(
+                "Empieza la medicion antes de medir el perfil.",
+                COLOR["alerta"],
+            )
+            return
+
+        texto = self.entry_estatura.get().strip()
+
+        if not texto.replace(".", "", 1).isdigit() or not 100 <= float(texto) <= 230:
+            self._set_estado(
+                "Escribe tu estatura en centimetros (entre 100 y 230).",
+                COLOR["alerta"],
+            )
+            return
+
+        self.estatura_pedida = float(texto)
+        self.capturas_perfil = []
+        self.boton_perfil.configure(state="disabled")
+        self._set_estado("De pie y quieto, de perfil a la camara...")
+        self._revisar_perfil()
+
+    def _revisar_perfil(self):
+        """Espera a que el hilo junte suficientes capturas."""
+
+        capturas = self.capturas_perfil
+
+        if capturas is None or not self.corriendo:
+            self.boton_perfil.configure(state="normal")
+            return
+
+        if len(capturas) < CAPTURAS_PARA_PERFIL:
+            self._set_estado(
+                f"Midiendo perfil... {len(capturas)}/{CAPTURAS_PARA_PERFIL}"
+            )
+            self.after(100, self._revisar_perfil)
+            return
+
+        self.capturas_perfil = None
+        self.boton_perfil.configure(state="normal")
+
+        try:
+            self.perfil = PerfilCorporal.desde_muestras(
+                self.estatura_pedida, capturas
+            )
+            self.perfil.guardar()
+        except (ValueError, ZeroDivisionError) as e:
+            self._set_estado(f"No se pudo medir el perfil: {e}", COLOR["alerta"])
+            return
+
+        tronco = self.perfil.en_cm("tronco")
+        femur = self.perfil.en_cm("femur")
+
+        self._set_estado(
+            f"Perfil guardado: tronco {tronco:.0f} cm, muslo {femur:.0f} cm",
+            COLOR["correcto"],
+        )
+
+    def _contar_repeticion(self, angulo_rodilla, hay_alerta):
+        """Avanza la maquina de estados y avisa al cerrar una serie."""
+
+        terminada = self.contador.actualizar(angulo_rodilla, hay_alerta)
+
+        self.valores["repeticiones"].configure(
+            text=str(self.contador.repeticiones)
+        )
+
+        if terminada is None:
+            return
+
+        # El veredicto de la repeticion pisa al de postura un momento:
+        # al terminar de subir es cuando se mira, y es lo que importa.
+        self._set_veredicto(
+            terminada.resumen(),
+            COLOR["alerta"] if not terminada.profunda else COLOR["correcto"],
+            COLOR["sobre_campo"],
+        )
+
+        self._set_estado(
+            f"Repeticion {terminada.numero}: "
+            f"minimo {terminada.angulo_minimo:.0f}°"
+        )
 
         self.valores["fps"].configure(text=f"{self.fps_medido:.0f} fps")
 
