@@ -96,14 +96,25 @@ class MjpegServer {
     }
   }
 
+  /// Corta el servidor y a todos los clientes de inmediato.
+  ///
+  /// Antes se esperaba a cerrar cada respuesta, una por una. Con un
+  /// cliente conectado que no esta leyendo, ese cierre no termina
+  /// nunca: el await se quedaba colgado, el servidor no llegaba a
+  /// cerrarse y seguia transmitiendo aunque se hubiera pulsado Parar.
+  /// Ademas se recorria la lista mientras el aviso de desconexion la
+  /// modificaba.
   Future<void> detener() async {
-    for (final cliente in _clientesConectados) {
-      await cliente.respuesta.close().catchError((_) {});
-    }
+    final servidor = _servidor;
+    _servidor = null;
+
+    // Se vacia antes de cerrar: los avisos de desconexion que lleguen
+    // despues encuentran la lista vacia y no molestan.
     _clientesConectados.clear();
 
-    await _servidor?.close(force: true);
-    _servidor = null;
+    // force: true destruye las conexiones abiertas sin esperar a que
+    // cada cliente termine de leer.
+    await servidor?.close(force: true);
   }
 }
 

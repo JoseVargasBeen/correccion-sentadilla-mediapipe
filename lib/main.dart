@@ -261,13 +261,30 @@ class _PantallaCamaraState extends State<PantallaCamara> {
   Future<void> _detenerTransmision() async {
     final controlador = _controlador;
 
-    if (controlador != null && controlador.value.isStreamingImages) {
-      await controlador.stopImageStream();
+    // La pantalla se pone en "parado" pase lo que pase con la
+    // limpieza. Antes iba al final, detras de varios await: si uno se
+    // colgaba, el boton Parar no hacia nada visible y la app seguia
+    // anunciando "En el aire".
+    try {
+      if (controlador != null && controlador.value.isStreamingImages) {
+        await controlador.stopImageStream().timeout(_limiteParada);
+      }
+    } catch (_) {
+      // Si la camara no responde se sigue: lo urgente es cortar el
+      // servidor, que es lo que el PC esta recibiendo.
     }
 
-    await _servidor.detener();
+    try {
+      await _servidor.detener().timeout(_limiteParada);
+    } catch (_) {}
+
     _conversor.detener();
-    await ConversorNativo.mantenerPantallaEncendida(false);
+
+    try {
+      await ConversorNativo.mantenerPantallaEncendida(
+        false,
+      ).timeout(_limiteParada);
+    } catch (_) {}
 
     if (!mounted) return;
 
@@ -277,6 +294,8 @@ class _PantallaCamaraState extends State<PantallaCamara> {
       _fps = 0;
     });
   }
+
+  static const _limiteParada = Duration(seconds: 2);
 
   @override
   void dispose() {
