@@ -171,12 +171,18 @@ def main():
     fuente = int(args.fuente) if args.fuente.isdigit() else args.fuente
 
     cap = LectorCamara(fuente)
-
-    if not cap.abierto():
-        print(f"No se pudo abrir la camara: {fuente}")
-        return 1
-
     cap.iniciar()
+
+    # LectorCamara abre la fuente dentro de su propio hilo, asi que
+    # conectar no es inmediato: hay que esperar a que confirme.
+    print(f"Conectando con {fuente} ...")
+
+    while not cap.conectado and cap.corriendo:
+        time.sleep(0.05)
+
+    if not cap.conectado:
+        print(cap.error or f"No se pudo abrir la camara: {fuente}")
+        return 1
 
     opciones = vision.PoseLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=POSE_MODEL_PATH),

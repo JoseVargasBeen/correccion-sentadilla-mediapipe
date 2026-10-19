@@ -28,7 +28,9 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import customtkinter as ctk
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
+
+import conexion_qr
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -51,11 +53,22 @@ ANCHO_MAX_VIDEO = 960
 PREFIJO_IP_CELULAR = "192.168.1."
 PUERTO_IP_WEBCAM = "8080"
 
+# Cuanto esperar al conectar y al leer de una fuente de red antes de
+# darla por perdida. Sin estos limites, OpenCV espera indefinidamente.
+TIMEOUT_CONEXION_MS = 5000
+TIMEOUT_LECTURA_MS = 5000
+
+# Si se conecto pero dejan de llegar frames por este tiempo, se asume
+# que la transmision murio (ej. se cerro la app del celular).
+SEGUNDOS_SIN_FRAME_PARA_CORTAR = 8.0
+
+# El giro se guarda en grados y se traduce aqui. Cada clic en las
+# flechas suma o resta 90, igual que girar el celular en la mano.
 ROTACIONES = {
-    "Sin rotar": None,
-    "90 horario": cv2.ROTATE_90_CLOCKWISE,
-    "90 antihorario": cv2.ROTATE_90_COUNTERCLOCKWISE,
-    "180 grados": cv2.ROTATE_180,
+    0: None,
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
 }
 
 
@@ -103,6 +116,63 @@ BGR_TRONCO = (80, 122, 31)      # #1F7A50
 FAMILIAS_TITULO = ("Bahnschrift SemiBold", "Bahnschrift", "Segoe UI Semibold")
 FAMILIAS_TEXTO = ("Bahnschrift Light", "Bahnschrift", "Segoe UI")
 FAMILIAS_CIFRA = ("Bahnschrift SemiCondensed", "Bahnschrift", "Segoe UI")
+
+
+def crear_icono_giro(horario, lado=20, color=COLOR["texto"]):
+    """Flecha circular dibujada a mano, no un caracter de la fuente.
+
+    Los glifos de flecha circular (U+21BB y companhia) no estan en
+    todas las tipografias: si faltan, Tk sustituye en silencio y
+    aparece un cuadro vacio. Dibujarla garantiza que se vea, y permite
+    que siga el mismo gris del resto del panel.
+    """
+
+    escala = 4  # se dibuja grande y se reduce: bordes limpios
+    px = lado * escala
+
+    imagen = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    dibujo = ImageDraw.Draw(imagen)
+
+    centro = px / 2
+    radio = px * 0.33
+    grosor = max(1, round(px * 0.09))
+
+    # Arco de 270 grados con el hueco arriba: asi cada punta queda a un
+    # lado de la abertura y las dos flechas se distinguen de inmediato.
+    # Con el hueco a un costado ambas salian casi iguales, y con el
+    # hueco mas estrecho las puntas se juntaban en un borron. En PIL el
+    # angulo 0 son las 3 en punto y crece en sentido horario.
+    inicio, fin = 315, 225
+    caja = [centro - radio, centro - radio, centro + radio, centro + radio]
+    dibujo.arc(caja, start=inicio, end=fin, fill=color, width=grosor)
+
+    # La punta va en el extremo hacia el que avanza el giro.
+    angulo = math.radians(fin if horario else inicio)
+    sentido = 1 if horario else -1
+
+    px_punta = centro + radio * math.cos(angulo)
+    py_punta = centro + radio * math.sin(angulo)
+
+    # Tangente al circulo en ese punto, segun hacia donde se avanza.
+    dx = -math.sin(angulo) * sentido
+    dy = math.cos(angulo) * sentido
+
+    largo = grosor * 3.2
+    ancho = grosor * 2.4
+
+    dibujo.polygon(
+        [
+            (px_punta + dx * largo, py_punta + dy * largo),
+            (px_punta - dy * ancho, py_punta + dx * ancho),
+            (px_punta + dy * ancho, py_punta - dx * ancho),
+        ],
+        fill=color,
+    )
+
+    imagen = imagen.resize((lado, lado), Image.LANCZOS)
+
+    return ctk.CTkImage(light_image=imagen, dark_image=imagen,
+                        size=(lado, lado))
 
 
 def completar_direccion(texto):
@@ -178,11 +248,17 @@ TOBILLO_D = 28
 # 30 grados es encorvamiento severo: por eso avisaba tan tarde. 15 es
 # donde ya se nota a simple vista.
 #
-# Sigue siendo una estimacion sobre proporciones medias, no una
-# calibracion. Para ajustarlo al cuerpo y al angulo de camara reales,
-# usar calibrar_encorvamiento.py.
+# El 0.08 ya NO es una estimacion: sale de calibrar_encorvamiento.py
+# con esta camara y este cuerpo (derecho 0.024, encorvado 0.140), y
+# coincide con lo medido sobre fotos de referencia, donde ninguna
+# espalda recta clara paso de 0.073 y ninguna encorvada bajo de 0.144.
+# Dos fuentes independientes dejando el limite en la misma franja.
+#
+# Reserva: la separacion de esa toma fue de 2.0 desviaciones, justo el
+# minimo que el script da por bueno. Si en uso real aparecen avisos
+# falsos, repetir la medida bien de perfil antes de tocar el numero.
 UMBRAL_INCLINACION = 20.0
-UMBRAL_JOROBA = 0.10
+UMBRAL_JOROBA = 0.08
 
 # Histeresis: al bajar el umbral, los valores rondando el limite
 # encienden y apagan la alerta varias veces por segundo y el campo de
@@ -280,39 +356,88 @@ class LectorCamara:
     """
 
     def __init__(self, fuente):
-        self.captura = cv2.VideoCapture(fuente)
-
-        # Algunos backends respetan esto y ya limitan la cola interna.
-        try:
-            self.captura.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+        self.fuente = fuente
 
         self.frame = None
         self.candado = threading.Lock()
-        self.corriendo = False
-        self.hilo = None
 
-    def abierto(self):
-        return self.captura.isOpened()
+        self.corriendo = False
+        self.conectado = False
+        self.error = None
+        self.ultimo_frame_en = 0.0
+
+        self.hilo = None
 
     def iniciar(self):
         self.corriendo = True
+        self.ultimo_frame_en = time.time()
         self.hilo = threading.Thread(target=self._bucle, daemon=True)
         self.hilo.start()
 
+    def _abrir(self):
+        """Abre la fuente. Para URLs se fijan timeouts explicitos: sin
+        ellos, si el celular no esta transmitiendo, OpenCV se queda
+        esperando indefinidamente."""
+
+        if isinstance(self.fuente, str):
+            captura = cv2.VideoCapture(
+                self.fuente,
+                cv2.CAP_FFMPEG,
+                [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, TIMEOUT_CONEXION_MS,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, TIMEOUT_LECTURA_MS,
+                ],
+            )
+        else:
+            captura = cv2.VideoCapture(self.fuente)
+
+        try:
+            captura.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        return captura
+
     def _bucle(self):
-        while self.corriendo:
-            ok, frame = self.captura.read()
+        """Todo el trabajo bloqueante (abrir, leer, liberar) ocurre en
+        este hilo. La interfaz nunca se queda congelada esperandolo."""
 
-            if not ok:
-                self.corriendo = False
-                break
+        captura = None
 
-            # Sobrescribe el anterior: si no alcanzo a procesarse, se
-            # descarta a proposito.
-            with self.candado:
-                self.frame = frame
+        try:
+            captura = self._abrir()
+
+            if not captura.isOpened():
+                self.error = f"No se pudo conectar con {self.fuente}"
+                return
+
+            self.conectado = True
+            self.ultimo_frame_en = time.time()
+
+            while self.corriendo:
+                ok, frame = captura.read()
+
+                if not ok:
+                    self.error = "Se perdio la senal de la camara"
+                    break
+
+                # Sobrescribe el anterior: si no alcanzo a procesarse,
+                # se descarta a proposito.
+                with self.candado:
+                    self.frame = frame
+                    self.ultimo_frame_en = time.time()
+
+        except Exception as e:
+            self.error = f"Error leyendo la camara: {e}"
+
+        finally:
+            self.conectado = False
+            self.corriendo = False
+
+            # Se libera desde el propio hilo: hacerlo desde la interfaz
+            # la bloquearia si read() quedo colgado.
+            if captura is not None:
+                captura.release()
 
     def leer(self):
         with self.candado:
@@ -321,14 +446,15 @@ class LectorCamara:
 
         return (frame is not None), frame
 
+    def segundos_sin_frame(self):
+        return time.time() - self.ultimo_frame_en
+
     def detener(self):
+        """Solo baja la bandera. No se hace join ni release aqui para no
+        congelar la interfaz si el hilo esta atascado en read(); el hilo
+        es daemon y se limpia solo."""
+
         self.corriendo = False
-
-        if self.hilo is not None:
-            self.hilo.join(timeout=1.0)
-            self.hilo = None
-
-        self.captura.release()
 
 
 def clasificar_postura(angulo_inclinacion, indice_joroba,
@@ -345,9 +471,13 @@ def clasificar_postura(angulo_inclinacion, indice_joroba,
     ('Espalda recta', False)
     >>> clasificar_postura(0.0, 0.12)
     ('Posible encorvamiento', True)
-    >>> clasificar_postura(0.0, 0.09, alerta_previa=True)[1]
+
+    En la franja entre el umbral y el margen, lo que decide es si ya
+    venia encendida: 0.07 mantiene la alerta pero no la enciende.
+
+    >>> clasificar_postura(0.0, 0.07, alerta_previa=True)[1]
     True
-    >>> clasificar_postura(0.0, 0.09, alerta_previa=False)[1]
+    >>> clasificar_postura(0.0, 0.07, alerta_previa=False)[1]
     False
     """
     margen_j = MARGEN_JOROBA if alerta_previa else 0.0
@@ -415,11 +545,34 @@ class PoseApp(ctk.CTk):
         self.candado_salida = threading.Lock()
         self.hilo_proceso = None
         self.senal_perdida = False
+        self.motivo_corte = None
 
-        # El hilo de proceso no puede consultar el desplegable: Tk solo
+        # Pasa a True con el primer frame pintado: sirve para cambiar
+        # el estado de "Conectando" a "Midiendo" una sola vez.
+        self.midiendo = False
+
+        # Identifica la sesion de medida en curso. _pintar se reagenda
+        # solo con after(); si se para y se vuelve a empezar antes de
+        # que salte el after pendiente, ese callback reviviria y
+        # quedarian dos cadenas pintando a la vez. Cada cadena lleva su
+        # numero y la que no coincide se apaga.
+        self.sesion = 0
+
+        # El hilo de proceso no puede consultar los botones: Tk solo
         # admite llamadas desde el hilo principal. La interfaz deja
-        # aqui el valor elegido y el hilo lo lee.
-        self.rotacion_actual = "Sin rotar"
+        # aqui la constante de giro ya resuelta y el hilo la lee.
+        self.giro_grados = 0
+        self.rotacion_actual = None
+
+        # Lectura del QR y red a la que volver despues: la del celular
+        # no comparte internet, asi que no conviene quedarse ahi.
+        self.escaner = None
+        self.red_previa = None
+
+        # Buzones del hilo que entra a la red del celular: escribe
+        # aqui y el hilo de la interfaz lo recoge.
+        self.qr_resultado = None
+        self.qr_avance = None
 
         # PhotoImage que se reutiliza entre frames.
         self.imagen_tk = None
@@ -602,18 +755,60 @@ class PoseApp(ctk.CTk):
 
         self.frame_ip_corta.pack(fill="x")
 
+        # Atajo para no teclear nada: Camcel muestra un QR con su
+        # direccion y, si creo su propia red, tambien con la clave.
+        self.boton_qr = ctk.CTkButton(
+            self.frame_fuente_celular, text="Leer QR del celular",
+            command=self._leer_qr, height=32,
+            font=self.fuente_texto, corner_radius=0,
+            fg_color="transparent", hover_color=COLOR["campo"],
+            border_width=1, border_color=COLOR["filete"],
+            text_color=COLOR["texto"],
+            text_color_disabled=COLOR["filete"],
+        )
+        self.boton_qr.pack(fill="x", pady=(ESPACIO["xs"], 0))
+
+        # La red del celular no da internet. Sin esta salida, el unico
+        # regreso a la WiFi de siempre seria cerrar la aplicacion.
+        self.boton_volver_red = ctk.CTkButton(
+            self.frame_fuente_celular, text="", command=self._volver_a_mi_red,
+            height=32, font=self.fuente_texto, corner_radius=0,
+            fg_color="transparent", hover_color=COLOR["campo"],
+            border_width=1, border_color=COLOR["filete"],
+            text_color=COLOR["texto"],
+        )
+
         self.frame_fuente_pc.pack(fill="x")
 
         self._etiqueta_control(controles, 2, "Giro")
-        self.combo_rotacion = ctk.CTkOptionMenu(
-            controles, values=list(ROTACIONES.keys()),
-            font=self.fuente_texto, corner_radius=0,
-            fg_color=COLOR["campo"], button_color=COLOR["filete"],
-            button_hover_color=COLOR["tenue"],
-            text_color=COLOR["texto"],
+
+        giro = ctk.CTkFrame(controles, fg_color="transparent")
+        giro.grid(row=2, column=1, sticky="ew", pady=ESPACIO["xs"])
+
+        # Las imagenes se guardan en el objeto: si solo viven dentro de
+        # este metodo, el recolector se las lleva y los botones salen
+        # vacios.
+        self.icono_antihorario = crear_icono_giro(horario=False)
+        self.icono_horario = crear_icono_giro(horario=True)
+
+        for columna, (icono, paso) in enumerate(
+            ((self.icono_antihorario, -90), (self.icono_horario, 90))
+        ):
+            ctk.CTkButton(
+                giro, text="", image=icono, width=46, height=32,
+                corner_radius=0, fg_color=COLOR["campo"],
+                hover_color=COLOR["filete"],
+                border_width=1, border_color=COLOR["filete"],
+                command=lambda p=paso: self._girar(p),
+            ).grid(row=0, column=columna, padx=(0, ESPACIO["sm"]))
+
+        # El angulo actual se escribe al lado: sin el, tras varios
+        # clics no hay forma de saber en que posicion quedo.
+        self.label_giro = ctk.CTkLabel(
+            giro, text="0°", font=self.fuente_texto,
+            text_color=COLOR["tenue"], anchor="w",
         )
-        self.combo_rotacion.grid(row=2, column=1, sticky="ew",
-                                 pady=ESPACIO["xs"])
+        self.label_giro.grid(row=0, column=2, padx=(ESPACIO["sm"], 0))
 
         botones = ctk.CTkFrame(panel, fg_color="transparent")
         botones.grid(row=1, column=0, sticky="ew",
@@ -763,8 +958,217 @@ class PoseApp(ctk.CTk):
         self.campo_veredicto.configure(fg_color=fondo)
         self.label_veredicto.configure(text=texto, text_color=tinte)
 
-    def _cambiar_rotacion(self, seleccion):
-        self.rotacion_actual = seleccion
+    def _girar(self, paso):
+        """Cada clic gira 90 grados, igual que voltear el celular.
+
+        Se aplica en caliente: el hilo de proceso lee el valor en cada
+        frame, asi que no hace falta parar y volver a empezar para
+        enderezar la imagen.
+        """
+        self.giro_grados = (self.giro_grados + paso) % 360
+        self.rotacion_actual = ROTACIONES[self.giro_grados]
+        self.label_giro.configure(text=f"{self.giro_grados}°")
+
+    # ---------------------------------
+    # Conexion por QR
+    # ---------------------------------
+
+    def _leer_qr(self):
+        """Escanea el QR de Camcel y deja la direccion lista.
+
+        Todo el trabajo lento (abrir la webcam, decodificar, entrar a la
+        red del celular) corre fuera del hilo de la interfaz; aqui solo
+        se lanza y se revisa el avance con after().
+        """
+
+        if self.corriendo:
+            self._set_estado(
+                "Para la medicion antes de leer el QR: la camara esta ocupada.",
+                COLOR["alerta"],
+            )
+            return
+
+        indice = 0
+        texto_indice = self.entry_indice_pc.get().strip()
+
+        if texto_indice.isdigit():
+            indice = int(texto_indice)
+
+        self.escaner = conexion_qr.EscanerQr(indice_camara=indice)
+        self.escaner.iniciar()
+
+        self.boton_qr.configure(state="disabled")
+        self._set_estado("Apunta la camara del PC al QR del celular.")
+        self._set_veredicto("Buscando QR", COLOR["filete"], COLOR["tenue"])
+        self._revisar_qr()
+
+    def _revisar_qr(self):
+
+        escaner = self.escaner
+
+        if escaner is None:
+            return
+
+        self._pintar_busqueda_qr(escaner)
+
+        if escaner.datos is not None:
+            self._aplicar_qr(escaner.datos)
+            return
+
+        if escaner.terminado:
+            self.escaner = None
+            self.boton_qr.configure(state="normal")
+            self._limpiar_video()
+            self._set_estado(
+                escaner.error or "No se pudo leer el QR.", COLOR["alerta"]
+            )
+            return
+
+        # Mas seguido que el sondeo de antes: esto ya no solo vigila,
+        # tambien dibuja, y a 80 ms el video se veia a saltos.
+        self.after(MS_ENTRE_PINTADOS, self._revisar_qr)
+
+    def _pintar_busqueda_qr(self, escaner):
+        """Muestra la webcam mientras busca, para saber a donde apuntar."""
+
+        frame, esquinas = escaner.ultimo_frame()
+
+        if frame is None:
+            return
+
+        vista = frame.copy()
+
+        if esquinas is not None:
+            # Marcar el QR en cuanto se ve, aunque aun no se haya
+            # podido decodificar: confirma que la camara lo tiene
+            # encuadrado y que solo falta acercarse o estabilizar.
+            puntos = esquinas.astype(int).reshape(-1, 2)
+            cv2.polylines(vista, [puntos], True, BGR_TRONCO, 3)
+
+        self._mostrar_frame(vista)
+
+    def _limpiar_video(self):
+        """Deja el panel de video vacio al salir del escaneo."""
+        self.imagen_tk = None
+        self.label_video.configure(image=None)
+
+    def _aplicar_qr(self, datos):
+        """Usa lo que traia el QR: red si hace falta, y la direccion."""
+
+        self.escaner = None
+        self.qr_resultado = None
+        self.qr_avance = None
+
+        # Entrar a la red del celular bloquea varios segundos, asi que
+        # va en un hilo. Ese hilo solo deja escrito como va: llamar a
+        # after() o tocar widgets desde aqui revienta, porque Tk solo
+        # admite llamadas desde el hilo principal.
+        def trabajo():
+            try:
+                if "ssid" in datos and "clave" in datos:
+                    anterior = conexion_qr.conectar_a_red(
+                        datos["ssid"], datos["clave"],
+                        al_avanzar=lambda t: setattr(self, "qr_avance", t),
+                    )
+
+                    # Solo se apunta la PRIMERA red de la que se salio.
+                    # Al escanear otra vez ya estando en la del celular,
+                    # "la anterior" seria esa misma, y al cerrar la app
+                    # volveria a dejar el PC sin internet.
+                    if self.red_previa is None and anterior != datos["ssid"]:
+                        self.red_previa = anterior
+
+                self.qr_resultado = ("listo", datos)
+
+            except conexion_qr.ErrorQr as e:
+                self.qr_resultado = ("fallo", str(e))
+
+        threading.Thread(target=trabajo, daemon=True).start()
+        self._revisar_conexion_qr()
+
+    def _revisar_conexion_qr(self):
+        """Traslada a la interfaz lo que va dejando el hilo de conexion."""
+
+        if self.qr_avance is not None:
+            self._set_estado(self.qr_avance)
+            self.qr_avance = None
+
+        if self.qr_resultado is None:
+            self.after(100, self._revisar_conexion_qr)
+            return
+
+        clase, carga = self.qr_resultado
+        self.qr_resultado = None
+
+        if clase == "listo":
+            self._qr_listo(carga)
+        elif clase == "red_restaurada":
+            self._red_restaurada(carga)
+        else:
+            self._qr_fallo(carga)
+
+    def _qr_listo(self, datos):
+        """Deja la direccion escrita y lista para empezar."""
+
+        self.tipo_camara.set("Celular")
+        self._cambiar_tipo_camara("Celular")
+
+        self.modo_direccion.set("Direccion completa")
+        self._cambiar_modo_direccion("Direccion completa")
+
+        self.entry_ip_completa.delete(0, "end")
+        self.entry_ip_completa.insert(0, conexion_qr.url_de(datos))
+
+        self.boton_qr.configure(state="normal")
+        self._limpiar_video()
+        self._set_veredicto("Sin lectura", COLOR["filete"], COLOR["tenue"])
+        self._actualizar_boton_red()
+        self._set_estado("Direccion lista. Pulsa Empezar.", COLOR["correcto"])
+
+    def _qr_fallo(self, mensaje):
+        self.boton_qr.configure(state="normal")
+        self._limpiar_video()
+        self._set_veredicto("Sin lectura", COLOR["filete"], COLOR["tenue"])
+        self._set_estado(mensaje, COLOR["alerta"])
+
+    def _actualizar_boton_red(self):
+        """El boton de regreso solo existe si hay a donde volver."""
+
+        if not self.red_previa:
+            self.boton_volver_red.pack_forget()
+            return
+
+        self.boton_volver_red.configure(
+            text=f"Volver a {self.red_previa}"
+        )
+        self.boton_volver_red.pack(fill="x", pady=(ESPACIO["xs"], 0))
+
+    def _volver_a_mi_red(self):
+        """Regresa a la WiFi de siempre, sin cerrar la aplicacion."""
+
+        destino = self.red_previa
+
+        if not destino:
+            return
+
+        if self.corriendo:
+            self.detener()
+
+        self.boton_volver_red.configure(state="disabled")
+        self._set_estado(f"Volviendo a {destino}...")
+
+        def trabajo():
+            conexion_qr.volver_a_red(destino)
+            self.qr_resultado = ("red_restaurada", destino)
+
+        threading.Thread(target=trabajo, daemon=True).start()
+        self._revisar_conexion_qr()
+
+    def _red_restaurada(self, destino):
+        self.red_previa = None
+        self.boton_volver_red.configure(state="normal")
+        self._actualizar_boton_red()
+        self._set_estado(f"De vuelta en {destino}.", COLOR["correcto"])
 
     def _cambiar_modo_direccion(self, seleccion):
 
@@ -795,6 +1199,14 @@ class PoseApp(ctk.CTk):
 
         if self.modo_direccion.get() == "Ultimo numero":
             ultimo = self.entry_ip_final.get().strip()
+
+            # Sin validar aqui, un campo vacio armaba
+            # "http://192.168.1.:8080/video": una URL rota que pasaba la
+            # comprobacion de cadena vacia y, cinco segundos despues,
+            # culpaba al celular de un error que estaba en el formulario.
+            if not (ultimo.isdigit() and 0 <= int(ultimo) <= 255):
+                return ""
+
             return f"http://{PREFIJO_IP_CELULAR}{ultimo}:{PUERTO_IP_WEBCAM}/video"
 
         return completar_direccion(self.entry_ip_completa.get())
@@ -808,24 +1220,15 @@ class PoseApp(ctk.CTk):
 
         if fuente == "":
             self._set_estado(
-                "Escribe la direccion del celular antes de empezar.",
+                "Revisa la direccion del celular antes de empezar.",
                 COLOR["alerta"],
             )
             return
 
+        # Conectar puede tardar segundos (o fallar). Se hace dentro del
+        # hilo del lector para que la ventana no se congele esperando;
+        # el resultado se descubre mas adelante, en _pintar.
         self.cap = LectorCamara(fuente)
-
-        if not self.cap.abierto():
-            # El error dice que hacer, no solo que fallo.
-            if self.tipo_camara.get() == "Esta PC":
-                aviso = f"No hay camara en el indice {fuente}. Prueba con 1."
-            else:
-                aviso = "El celular no responde. Revisa que IP Webcam este abierto y en la misma red."
-
-            self._set_estado(aviso, COLOR["alerta"])
-            self.cap = None
-            return
-
         self.cap.iniciar()
 
         options = vision.PoseLandmarkerOptions(
@@ -844,22 +1247,25 @@ class PoseApp(ctk.CTk):
         self.start_time = time.time()
         self.previous_time = time.time()
         self.senal_perdida = False
+        self.motivo_corte = None
+        self.midiendo = False
         self.ultima_salida = None
-        self.rotacion_actual = self.combo_rotacion.get()
 
         self.corriendo = True
+        self.sesion += 1
+
         self.hilo_proceso = threading.Thread(
             target=self._bucle_proceso, daemon=True
         )
         self.hilo_proceso.start()
 
-        self._set_estado("Midiendo")
+        self._set_estado("Conectando")
         self._set_veredicto(
             "Buscando", COLOR["filete"], COLOR["tenue"]
         )
         self._actualizar_botones()
 
-        self._pintar()
+        self._pintar(self.sesion)
 
     def detener(self):
 
@@ -885,6 +1291,28 @@ class PoseApp(ctk.CTk):
         self._set_estado("Detenido")
         self._actualizar_botones()
 
+    def _consejo_para(self, motivo):
+        """El mensaje dice que hacer, no solo que fallo."""
+
+        if self.tipo_camara.get() == "Esta PC":
+            if "No se pudo conectar" in motivo:
+                return "No hay camara en ese indice. Prueba con 1."
+            return motivo
+
+        if "No se pudo conectar" in motivo:
+            return (
+                "El celular no responde. Revisa que Camcel este "
+                "transmitiendo y en la misma red WiFi."
+            )
+
+        if "Dejaron de llegar" in motivo:
+            return (
+                "Se corto la transmision. Revisa que Camcel siga "
+                "abierto y la pantalla encendida."
+            )
+
+        return motivo
+
     def _reiniciar_valores(self):
         """Al detener, los ultimos numeros dejan de ser ciertos."""
         for clave, valor_label in self.valores.items():
@@ -896,6 +1324,15 @@ class PoseApp(ctk.CTk):
 
     def on_closing(self):
         self.detener()
+
+        if self.escaner is not None:
+            self.escaner.cancelar()
+
+        # La red del celular no da internet: dejar el PC ahi al cerrar
+        # seria dejarlo incomunicado sin avisar.
+        if self.red_previa:
+            conexion_qr.volver_a_red(self.red_previa)
+
         self.destroy()
 
     # ---------------------------------
@@ -916,18 +1353,42 @@ class PoseApp(ctk.CTk):
         MediaPipe; Tk se queda para el hilo principal, que es lo unico
         que Tk admite.
         """
-        while self.corriendo:
-            ok, frame_bgr = self.cap.leer()
+        # Referencias propias del hilo. detener() pone self.cap y
+        # self.detector a None tras un join acotado a un segundo: si ese
+        # join expira (una vuelta lenta de MediaPipe basta) este hilo
+        # seguiria vivo y leeria None.
+        cap = self.cap
+        detector = self.detector
 
-            if not self.cap.corriendo:
+        while self.corriendo:
+            ok, frame_bgr = cap.leer()
+
+            # El lector termino: no se pudo conectar, o la transmision
+            # se corto. El motivo lo trae el propio lector.
+            if not cap.corriendo:
+                self.motivo_corte = cap.error
                 self.senal_perdida = True
                 return
 
             if not ok:
+                # Sin imagenes por mucho tiempo: no se logro conectar, o
+                # la app del celular se cerro sin avisar. El limite
+                # cubre tambien la conexion, porque cv2.VideoCapture no
+                # siempre respeta su propio timeout de apertura y sin
+                # esto la espera seria eterna.
+                if cap.segundos_sin_frame() > SEGUNDOS_SIN_FRAME_PARA_CORTAR:
+                    self.motivo_corte = (
+                        "Dejaron de llegar imagenes del celular"
+                        if cap.conectado
+                        else f"No se pudo conectar con {cap.fuente}"
+                    )
+                    self.senal_perdida = True
+                    return
+
                 time.sleep(0.002)
                 continue
 
-            rotacion = ROTACIONES[self.rotacion_actual]
+            rotacion = self.rotacion_actual
 
             if rotacion is not None:
                 frame_bgr = cv2.rotate(frame_bgr, rotacion)
@@ -937,8 +1398,13 @@ class PoseApp(ctk.CTk):
                                 data=frame_rgb)
             timestamp_ms = int((time.time() - self.start_time) * 1000)
 
+            # Si pararon mientras se preparaba el frame, no se entra a
+            # MediaPipe: detener() podria estar cerrando el detector.
+            if not self.corriendo:
+                return
+
             try:
-                result = self.detector.detect_for_video(mp_image, timestamp_ms)
+                result = detector.detect_for_video(mp_image, timestamp_ms)
             except Exception:
                 # Un timestamp repetido o un frame corrupto no deben
                 # tumbar el hilo: se descarta y se sigue.
@@ -1020,14 +1486,15 @@ class PoseApp(ctk.CTk):
 
         return output, medidas
 
-    def _pintar(self):
+    def _pintar(self, sesion):
         """Pinta el ultimo resultado disponible. Hilo de la interfaz."""
-        if not self.corriendo:
+        if not self.corriendo or sesion != self.sesion:
             return
 
         if self.senal_perdida:
+            motivo = self.motivo_corte or "Se corto la senal de la camara"
             self.detener()
-            self._set_estado("Se corto la senal de la camara", COLOR["alerta"])
+            self._set_estado(self._consejo_para(motivo), COLOR["alerta"])
             return
 
         with self.candado_salida:
@@ -1037,15 +1504,19 @@ class PoseApp(ctk.CTk):
         # Sin frame nuevo no se repinta: reprocesar el mismo no aporta
         # nada y solo gasta el hilo de la interfaz.
         if paquete is None:
-            self.after(5, self._pintar)
+            self.after(5, lambda: self._pintar(sesion))
             return
 
         salida, medidas = paquete
 
+        if not self.midiendo:
+            self.midiendo = True
+            self._set_estado("Midiendo")
+
         self._mostrar_medidas(medidas)
         self._mostrar_frame(salida)
 
-        self.after(MS_ENTRE_PINTADOS, self._pintar)
+        self.after(MS_ENTRE_PINTADOS, lambda: self._pintar(sesion))
 
     def _mostrar_medidas(self, medidas):
         if "rodilla" in medidas:
