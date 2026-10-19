@@ -38,7 +38,6 @@ import time
 import tkinter.font as tkfont
 
 import cv2
-import numpy as np
 import mediapipe as mp
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
@@ -242,6 +241,60 @@ CADERA_I = 23
 CADERA_D = 24
 RODILLA_D = 26
 TOBILLO_D = 28
+
+# Los mismos puntos agrupados por lado del cuerpo.
+LADOS = {
+    "izquierdo": {"oreja": 7, "hombro": 11, "cadera": 23,
+                  "rodilla": 25, "tobillo": 27},
+    "derecho": {"oreja": 8, "hombro": 12, "cadera": 24,
+                "rodilla": 26, "tobillo": 28},
+}
+
+# Visibilidad media por debajo de la cual el lado no se mide: es
+# MediaPipe diciendo que esta adivinando.
+VISIBILIDAD_MINIMA = 0.5
+
+
+def lado_visible(landmarks):
+    """El lado del cuerpo que la camara ve, y lo seguro que esta.
+
+    De perfil, la pierna del otro lado queda tapada y MediaPipe la
+    rellena por deduccion. Medir los angulos sobre ese lado daba
+    numeros inventados con total aplomo: antes se usaba siempre el
+    derecho, asi que bastaba ponerse con el izquierdo hacia la camara
+    para que la sentadilla se midiera sobre una pierna que no se veia.
+    """
+
+    def visibilidad(lado):
+        indices = LADOS[lado].values()
+        return sum(
+            getattr(landmarks[i], "visibility", 1.0) for i in indices
+        ) / len(indices)
+
+    mejor = max(LADOS, key=visibilidad)
+
+    return mejor, visibilidad(mejor)
+
+
+def medidas_de(points, lado):
+    """Angulos y postura de un fotograma, sobre el lado visible.
+
+    La app y calibrar_encorvamiento.py usan esta misma funcion: si
+    midieran distinto, el umbral calibrado no valdria para la app.
+    """
+
+    p = {nombre: points[i] for nombre, i in LADOS[lado].items()}
+
+    hombro_medio = punto_medio(points[HOMBRO_I], points[HOMBRO_D])
+    cadera_medio = punto_medio(points[CADERA_I], points[CADERA_D])
+
+    return {
+        "rodilla": calcular_angulo(p["cadera"], p["rodilla"], p["tobillo"]),
+        "cadera": calcular_angulo(p["hombro"], p["cadera"], p["rodilla"]),
+        "inclinacion": angulo_respecto_vertical(cadera_medio, hombro_medio),
+        "joroba": indice_encorvamiento(p["oreja"], hombro_medio, cadera_medio),
+        "_tronco": (cadera_medio, hombro_medio),
+    }
 
 
 # =================================
@@ -1316,6 +1369,7 @@ class PoseApp(ctk.CTk):
         self.midiendo = False
         self.ultima_salida = None
         self.contador.reiniciar()
+        self.frames_descartados = 0
 
         self.corriendo = True
         self.sesion += 1
@@ -1529,6 +1583,16 @@ class PoseApp(ctk.CTk):
                     BGR_SKELETON, grosor_linea,
                 )
 
+        lado, visibilidad = lado_visible(pose_landmarks)
+
+        # Ni de un lado ni del otro se ve bien la pierna: la persona
+        # esta tapada o medio fuera de cuadro. Mejor no medir que
+        # medir lo que MediaPipe se imagina.
+        if visibilidad < VISIBILIDAD_MINIMA:
+            return output, medidas
+
+        # Solo entran al perfil fotogramas con la pierna bien vista;
+        # antes entraban todos y uno malo ensuciaba el promedio.
         if self.capturas_perfil is not None:
             self.capturas_perfil.append(list(points))
 
@@ -1542,35 +1606,15 @@ class PoseApp(ctk.CTk):
             self.frames_descartados += 1
             return output, medidas
 
-        necesarios_piernas = [HOMBRO_D, CADERA_D, RODILLA_D, TOBILLO_D]
+        medidas = medidas_de(points, lado)
+        cadera_medio, hombro_medio = medidas.pop("_tronco")
 
-        if all(points[i] is not None for i in necesarios_piernas):
-            medidas["rodilla"] = calcular_angulo(
-                points[CADERA_D], points[RODILLA_D], points[TOBILLO_D]
-            )
-            medidas["cadera"] = calcular_angulo(
-                points[HOMBRO_D], points[CADERA_D], points[RODILLA_D]
-            )
-
-        necesarios_espalda = [HOMBRO_I, HOMBRO_D, CADERA_I, CADERA_D, OREJA_D]
-
-        if all(points[i] is not None for i in necesarios_espalda):
-            hombro_medio = punto_medio(points[HOMBRO_I], points[HOMBRO_D])
-            cadera_medio = punto_medio(points[CADERA_I], points[CADERA_D])
-
-            medidas["inclinacion"] = angulo_respecto_vertical(
-                cadera_medio, hombro_medio
-            )
-            medidas["joroba"] = indice_encorvamiento(
-                points[OREJA_D], hombro_medio, cadera_medio
-            )
-
-            cv2.line(
-                output,
-                (int(cadera_medio[0]), int(cadera_medio[1])),
-                (int(hombro_medio[0]), int(hombro_medio[1])),
-                BGR_TRONCO, grosor_linea,
-            )
+        cv2.line(
+            output,
+            (int(cadera_medio[0]), int(cadera_medio[1])),
+            (int(hombro_medio[0]), int(hombro_medio[1])),
+            BGR_TRONCO, grosor_linea,
+        )
 
         return output, medidas
 

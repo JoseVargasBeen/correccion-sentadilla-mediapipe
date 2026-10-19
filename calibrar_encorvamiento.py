@@ -31,15 +31,11 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 from app_pose import (
-    CADERA_D,
-    CADERA_I,
-    HOMBRO_D,
-    HOMBRO_I,
-    OREJA_D,
     POSE_MODEL_PATH,
+    VISIBILIDAD_MINIMA,
     LectorCamara,
-    indice_encorvamiento,
-    punto_medio,
+    lado_visible,
+    medidas_de,
 )
 
 SEGUNDOS_POR_FASE = 12
@@ -51,17 +47,18 @@ FASES = [
 ]
 
 
-def medir_indice(points):
-    """Indice de encorvamiento de un frame, o None si faltan puntos."""
-    necesarios = [HOMBRO_I, HOMBRO_D, CADERA_I, CADERA_D, OREJA_D]
+def medir_indice(points, landmarks):
+    """Indice de encorvamiento de un frame, o None si no se ve bien.
 
-    if any(points[i] is None for i in necesarios):
+    Usa medidas_de de app_pose, la misma que usa la app: si midieran
+    distinto, el umbral que sale de aqui no valdria alli.
+    """
+    lado, visibilidad = lado_visible(landmarks)
+
+    if visibilidad < VISIBILIDAD_MINIMA:
         return None
 
-    hombro = punto_medio(points[HOMBRO_I], points[HOMBRO_D])
-    cadera = punto_medio(points[CADERA_I], points[CADERA_D])
-
-    return indice_encorvamiento(points[OREJA_D], hombro, cadera)
+    return medidas_de(points, lado)["joroba"]
 
 
 def puntos_de(result, ancho, alto):
@@ -105,7 +102,9 @@ def recoger(cap, detector, inicio, etiqueta, instruccion):
 
         alto, ancho = frame.shape[:2]
         points = puntos_de(result, ancho, alto)
-        indice = medir_indice(points) if points else None
+        indice = (
+            medir_indice(points, result.pose_landmarks[0]) if points else None
+        )
 
         ahora = time.time()
 
