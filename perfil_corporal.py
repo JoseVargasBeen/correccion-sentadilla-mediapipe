@@ -49,6 +49,12 @@ TOBILLO_I, TOBILLO_D = 27, 28
 
 ARCHIVO_PERFIL = "perfil_corporal.json"
 
+# Campo de vision horizontal tipico de una camara trasera de celular.
+# Es una suposicion: varia entre modelos y con el zoom. De lo acertada
+# que sea depende la correccion de perspectiva, asi que conviene poder
+# cambiarla desde fuera.
+FOV_TIPICO = 67.0
+
 # Fraccion de la estatura a la que queda la nariz por encima del
 # tobillo, en proporciones antropometricas medias. Solo se usa para
 # pasar a centimetros; ninguna decision de postura depende de este
@@ -80,6 +86,59 @@ CAIDA_TRONCO_SOSPECHOSA = 0.93
 # landmark perdido.
 FACTOR_MIN_SANO = 0.55
 FACTOR_MAX_SANO = 1.8
+
+
+def focal_en_px(ancho_imagen, fov_grados=None):
+    """Distancia focal equivalente, en pixeles.
+
+    Es lo que convierte angulos en pixeles: con ella se puede pasar de
+    la imagen al espacio y al reves. Se deduce del campo de vision,
+    que es un dato aproximado de la camara, no una medida exacta.
+    """
+
+    fov = FOV_TIPICO if fov_grados is None else fov_grados
+
+    return (ancho_imagen / 2) / math.tan(math.radians(fov) / 2)
+
+
+def _normalizar(vector):
+    largo = math.sqrt(sum(c * c for c in vector))
+
+    if largo < 1e-9:
+        return (0.0, 0.0, 1.0)
+
+    return tuple(c / largo for c in vector)
+
+
+def _cortar_rayo_con_esfera(rayo, centro, radio):
+    """Los puntos del rayo que quedan a `radio` del centro.
+
+    El rayo sale de la camara (el origen), asi que el punto buscado es
+    s*rayo. Imponer que diste `radio` del otro extremo del hueso da
+    una ecuacion de segundo grado en s.
+
+    Devuelve las DOS soluciones porque las dos son fisicamente validas:
+    una imagen no distingue si la articulacion se fue hacia la camara o
+    hacia el fondo. Quien llama decide.
+    """
+
+    proyeccion = sum(r * c for r, c in zip(rayo, centro))
+    distancia_centro2 = sum(c * c for c in centro)
+
+    discriminante = proyeccion ** 2 - distancia_centro2 + radio ** 2
+
+    if discriminante < 0:
+        # El hueso no alcanza ese rayo: la escala o la deteccion no
+        # cuadran. Mejor no devolver un numero inventado.
+        return []
+
+    raiz = math.sqrt(discriminante)
+
+    return [
+        tuple(s * c for c in rayo)
+        for s in (proyeccion - raiz, proyeccion + raiz)
+        if s > 0
+    ]
 
 
 def distancia(a, b):
@@ -231,6 +290,188 @@ class PerfilCorporal:
             return None
 
         return actual / self.razon_tronco
+
+    # ---------------------------------
+    # Reconstruccion 3D con perspectiva
+    # ---------------------------------
+
+    def distancia_camara_cm(self, puntos, ancho_imagen, fov_grados=FOV_TIPICO):
+        """A que distancia esta la persona, en centimetros.
+
+        Se despeja del ancho de caderas: se sabe cuanto mide en
+        centimetros (del perfil) y cuanto ocupa en pixeles ahora. Cuanto
+        mas pequeno se ve, mas lejos esta.
+
+        Arrastra el error de la estatura extrapolada, asi que sirve
+        para informar, no para reconstruir: la reconstruccion usa
+        anchos de cadera, donde ese error se cancela.
+        """
+
+        en_caderas = self.distancia_camara_en_caderas(
+            puntos, ancho_imagen, fov_grados
+        )
+        caderas_cm = self.en_cm("ancho_caderas")
+
+        if en_caderas is None or caderas_cm < 1e-6:
+            return None
+
+        return en_caderas * caderas_cm
+
+    def distancia_camara_en_caderas(self, puntos, ancho_imagen,
+                                    fov_grados=FOV_TIPICO):
+        """Distancia a la camara medida en anchos de cadera.
+
+        Esta es la unidad que usa la reconstruccion. Tomar el ancho de
+        cadera como patron, en vez del centimetro, quita de en medio la
+        estatura: su error de extrapolacion afectaria por igual al
+        hueso y a la distancia, y al dividirse se cancela. Sin esto, un
+        hueso supuesto un 5% mas largo de lo real obliga a inclinarlo
+        para que cuadre, e inventa grados que no existen.
+        """
+
+        caderas_px = distancia(puntos[CADERA_I], puntos[CADERA_D])
+
+        if caderas_px < 1e-6:
+            return None
+
+        return focal_en_px(ancho_imagen, fov_grados) / caderas_px
+
+    def reconstruir_segmento(self, puntos, nombre, ancho_imagen, alto_imagen,
+                             fov_grados=FOV_TIPICO):
+        """Devuelve los dos extremos del segmento en 3D, en centimetros.
+
+        El truco: del extremo cercano se sabe la profundidad (la da el
+        ancho de caderas). Del lejano solo se sabe la RECTA por la que
+        se ve, porque una imagen no da profundidad. Pero tambien se
+        sabe cuanto mide el hueso, y sobre esa recta solo hay dos
+        puntos a esa distancia exacta del primero. Es cortar una recta
+        con una esfera: se resuelve con una ecuacion de segundo grado,
+        sin aproximar nada.
+
+        Las coordenadas van en anchos de cadera, no en centimetros,
+        para que el error de la estatura no entre aqui. Para pasarlas a
+        centimetros, multiplicar por en_cm("ancho_caderas").
+
+        Las dos soluciones son fisicamente validas: una imagen no
+        distingue si la rodilla se adelanto o se fue hacia atras. Se
+        elige la de MENOR inclinacion, que es la lectura prudente: de
+        dos explicaciones compatibles con lo que se ve, la menos
+        extrema. Quedarse siempre con la cercana inventaba 26 grados
+        de flexion en una pierna completamente recta.
+        """
+
+        a, b, referencia = self._extremos(puntos, nombre)
+
+        caderas_ref = self.segmentos_px.get("ancho_caderas", 0.0)
+
+        if caderas_ref < 1e-6:
+            return None
+
+        # Longitud del hueso expresada en anchos de cadera.
+        largo = self.segmentos_px.get(referencia, 0.0) / caderas_ref
+
+        profundidad = self.distancia_camara_en_caderas(
+            puntos, ancho_imagen, fov_grados
+        )
+
+        if largo < 1e-6 or not profundidad:
+            return None
+
+        foco = focal_en_px(ancho_imagen, fov_grados)
+        centro = (ancho_imagen / 2, alto_imagen / 2)
+
+        # Extremo cercano: se conoce su profundidad, asi que basta
+        # deshacer la proyeccion.
+        proximal = (
+            (a[0] - centro[0]) * profundidad / foco,
+            (a[1] - centro[1]) * profundidad / foco,
+            profundidad,
+        )
+
+        # Extremo lejano: solo se conoce su direccion.
+        rayo = _normalizar((b[0] - centro[0], b[1] - centro[1], foco))
+
+        candidatos = _cortar_rayo_con_esfera(rayo, proximal, largo)
+
+        if not candidatos:
+            return None
+
+        def inclinacion(punto):
+            vector = tuple(p - q for p, q in zip(punto, proximal))
+            modulo = math.sqrt(sum(c * c for c in vector))
+
+            if modulo < 1e-9:
+                return math.inf
+
+            return math.acos(min(1.0, abs(vector[1]) / modulo))
+
+        return proximal, min(candidatos, key=inclinacion)
+
+    def candidatos_segmento(self, puntos, nombre, ancho_imagen, alto_imagen,
+                            fov_grados=FOV_TIPICO):
+        """Las dos reconstrucciones posibles del segmento.
+
+        Se exponen las dos porque elegir entre ellas no es un problema
+        de geometria sino de contexto: ver SeguidorSegmentos.
+        """
+
+        a, b, referencia = self._extremos(puntos, nombre)
+
+        caderas_ref = self.segmentos_px.get("ancho_caderas", 0.0)
+
+        if caderas_ref < 1e-6:
+            return []
+
+        largo = self.segmentos_px.get(referencia, 0.0) / caderas_ref
+
+        profundidad = self.distancia_camara_en_caderas(
+            puntos, ancho_imagen, fov_grados
+        )
+
+        if largo < 1e-6 or not profundidad:
+            return []
+
+        foco = focal_en_px(ancho_imagen, fov_grados)
+        centro = (ancho_imagen / 2, alto_imagen / 2)
+
+        proximal = (
+            (a[0] - centro[0]) * profundidad / foco,
+            (a[1] - centro[1]) * profundidad / foco,
+            profundidad,
+        )
+
+        rayo = _normalizar((b[0] - centro[0], b[1] - centro[1], foco))
+
+        return [
+            (proximal, distal)
+            for distal in _cortar_rayo_con_esfera(rayo, proximal, largo)
+        ]
+
+    def angulo_con_vertical_3d(self, puntos, nombre, ancho_imagen, alto_imagen,
+                               fov_grados=FOV_TIPICO):
+        """Inclinacion real del segmento respecto a la vertical.
+
+        A diferencia de angulo_con_vertical, esta si corrige la
+        perspectiva, y por eso sirve tambien para las piernas.
+        """
+
+        extremos = self.reconstruir_segmento(
+            puntos, nombre, ancho_imagen, alto_imagen, fov_grados
+        )
+
+        if extremos is None:
+            return None
+
+        (ax, ay, az), (bx, by, bz) = extremos
+
+        vector = (bx - ax, by - ay, bz - az)
+        largo = math.sqrt(sum(c * c for c in vector))
+
+        if largo < 1e-6:
+            return None
+
+        # El eje vertical de la imagen es y, que crece hacia abajo.
+        return math.degrees(math.acos(min(1.0, abs(vector[1]) / largo)))
 
     # ---------------------------------
     # Angulos reales a partir del escorzo
@@ -420,3 +661,282 @@ class PerfilCorporal:
                 return cls(**json.load(archivo))
         except (OSError, ValueError, TypeError):
             return None
+
+
+def inclinacion_de(extremos):
+    """Angulo del segmento con la vertical, en grados."""
+
+    (ax, ay, az), (bx, by, bz) = extremos
+
+    vector = (bx - ax, by - ay, bz - az)
+    modulo = math.sqrt(sum(c * c for c in vector))
+
+    if modulo < 1e-9:
+        return None
+
+    return math.degrees(math.acos(min(1.0, abs(vector[1]) / modulo)))
+
+
+class SeguidorSegmentos:
+    """Resuelve la ambiguedad de profundidad siguiendo el movimiento.
+
+    Reconstruir un hueso desde una sola camara deja siempre dos
+    respuestas: la articulacion pudo irse hacia la camara o hacia el
+    fondo, y en la imagen se ven igual. Ninguna regla fija acierta
+    siempre; probado contra verdad conocida, quedarse con la cercana
+    inventa 26 grados en una pierna recta, y quedarse con la menos
+    inclinada se equivoca en 26 cuando la flexion es real.
+
+    El seguimiento temporal TAMPOCO lo resuelve, y conviene saberlo
+    antes de confiar en el. Medido contra verdad conocida sobre una
+    sentadilla completa, fotograma a fotograma y a 2 grados por frame:
+
+        flexion real     estimado
+           0 grados         0.0     <- exacto
+          10 grados        10.0     <- exacto
+          20 grados         6.6
+          30 grados         4.2
+          60 grados        39.4
+
+    La razon es geometrica, no un fallo de implementacion: las dos
+    reconstrucciones parten del mismo punto con la pierna recta y se
+    separan de forma continua segun se flexiona. Las dos son curvas
+    continuas, asi que "seguir la que estaba cerca" no distingue la
+    buena. Es la ambiguedad del cubo de Necker: de frente, una pierna
+    que se adelanta y otra que se atrasa producen la misma imagen.
+
+    Lo que si puede romper el empate son restricciones anatomicas: la
+    rodilla solo dobla hacia un lado, y en sentadilla el pie no se
+    despega del suelo. Reconstruyendo femur y tibia a la vez, de las
+    cuatro combinaciones solo una cumple ambas. Eso esta sin hacer.
+
+    Mientras tanto: fiable con el tronco y con flexiones pequenas,
+    no fiable con piernas muy flexionadas.
+    """
+
+    def __init__(self, perfil, ancho_imagen, alto_imagen,
+                 fov_grados=FOV_TIPICO):
+        self.perfil = perfil
+        self.ancho_imagen = ancho_imagen
+        self.alto_imagen = alto_imagen
+        self.fov_grados = fov_grados
+
+        self._ultima_z = {}
+
+    def reiniciar(self):
+        """Olvida el seguimiento. Usar si se perdio a la persona: con
+        un hueco en el video, la continuidad ya no vale como pista."""
+        self._ultima_z.clear()
+
+    def seguir(self, puntos, nombre):
+        """Reconstruye el segmento continuando el movimiento anterior."""
+
+        candidatos = self.perfil.candidatos_segmento(
+            puntos, nombre, self.ancho_imagen, self.alto_imagen,
+            self.fov_grados,
+        )
+
+        if not candidatos:
+            return None
+
+        previa = self._ultima_z.get(nombre)
+
+        if previa is None:
+            # Arranque: sin historia, se toma la lectura prudente. Es
+            # correcta mientras se empiece de pie.
+            # El None se filtra aparte y no con `or`: una inclinacion
+            # de 0.0 grados es falsa para Python, y con `or` se
+            # descartaba justo la lectura perfecta de la pose erguida.
+            def prudencia(extremos):
+                angulo = inclinacion_de(extremos)
+
+                return math.inf if angulo is None else angulo
+
+            elegido = min(candidatos, key=prudencia)
+        else:
+            # La profundidad del extremo movil no puede dar saltos.
+            elegido = min(
+                candidatos, key=lambda e: abs(e[1][2] - previa)
+            )
+
+        self._ultima_z[nombre] = elegido[1][2]
+
+        return elegido
+
+    def angulo_con_vertical(self, puntos, nombre):
+        extremos = self.seguir(puntos, nombre)
+
+        return None if extremos is None else inclinacion_de(extremos)
+
+
+class ReconstructorPierna:
+    """Reconstruye cadera-rodilla-tobillo resolviendo la ambiguedad con
+    el pie como ancla.
+
+    La ambiguedad de profundidad no se puede romper mirando un hueso
+    aislado, ni siguiendolo en el tiempo: las dos reconstrucciones son
+    continuas y salen del mismo sitio. Pero la pierna no es un hueso
+    suelto, es una cadena, y el pie no se despega del suelo.
+
+    Eso da la restriccion que faltaba. De las dos rodillas posibles,
+    cada una obliga a un tobillo distinto; solo una deja el tobillo a
+    la profundidad donde realmente esta el pie, que se mide una vez de
+    pie y no cambia mientras no se den pasos.
+
+    NO USAR TODAVIA CON VIDEO REAL. La idea funciona y la geometria es
+    exacta, pero el metodo es demasiado sensible al ruido para servir:
+
+        ruido en landmarks    error medio del angulo
+             0 px                  0.0 grados
+           0.5 px                 30.2 grados
+             1 px                 32.0 grados
+             2 px                 38.8 grados
+
+    Con datos perfectos clava el angulo de rodilla de 180 a 80 grados
+    con error 0.00. Con medio pixel de ruido deja de servir.
+
+    El motivo es que el problema esta mal condicionado justo donde
+    empieza el movimiento. Con la pierna recta, las dos soluciones
+    casi coinciden, y elegir entre ellas depende de diferencias mas
+    pequenas que el temblor de MediaPipe. Ademas el fallo no es
+    gradual: equivocar la rama no da un error pequeno, da el doble de
+    la inclinacion, unos 70 grados. Y como toda sentadilla empieza de
+    pie, se entra siempre por el peor caso.
+
+    Se probo pesar la continuidad entre fotogramas para castigar los
+    saltos de rama. No basta: con movimiento fluido a 30 fps y medio
+    pixel de ruido el error medio sigue en 30 grados, y encima empeora
+    el caso limpio. Se quito: no se deja un ajuste que perjudica.
+
+    Equivocar el campo de vision, en cambio, apenas importa: ±10
+    grados de FOV cuestan unos 3 de angulo. El eslabon debil es el
+    ruido, no la suposicion de la camara.
+
+    Para que esto fuera utilizable harian falta mas restricciones que
+    un solo fotograma no da: una segunda camara, o un modelo del
+    cuerpo entero que resuelva todas las articulaciones a la vez en
+    lugar de hueso por hueso.
+    """
+
+    def __init__(self, perfil, ancho_imagen, alto_imagen,
+                 fov_grados=FOV_TIPICO):
+        self.perfil = perfil
+        self.ancho_imagen = ancho_imagen
+        self.alto_imagen = alto_imagen
+        self.fov_grados = fov_grados
+
+        self._z_tobillo = {}
+
+    def anclar(self, puntos, lado):
+        """Fija donde esta el pie. Llamar con la persona de pie."""
+
+        cadena = self._reconstruir(puntos, lado, z_ancla=None)
+
+        if cadena is None:
+            return False
+
+        self._z_tobillo[lado] = cadena[2][2]
+
+        return True
+
+    def anclado(self, lado):
+        return lado in self._z_tobillo
+
+    def soltar(self):
+        """Olvida el ancla: usar si la persona dio un paso."""
+        self._z_tobillo.clear()
+
+    def _rayo_a(self, punto):
+        foco = focal_en_px(self.ancho_imagen, self.fov_grados)
+
+        return _normalizar((
+            punto[0] - self.ancho_imagen / 2,
+            punto[1] - self.alto_imagen / 2,
+            foco,
+        ))
+
+    def _reconstruir(self, puntos, lado, z_ancla):
+        """Mejor cadena cadera-rodilla-tobillo, en anchos de cadera."""
+
+        caderas_ref = self.perfil.segmentos_px.get("ancho_caderas", 0.0)
+
+        if caderas_ref < 1e-6:
+            return None
+
+        largo_tibia = self.perfil.segmentos_px.get("tibia", 0.0) / caderas_ref
+
+        if largo_tibia < 1e-6:
+            return None
+
+        candidatos_femur = self.perfil.candidatos_segmento(
+            puntos, f"femur_{lado}", self.ancho_imagen, self.alto_imagen,
+            self.fov_grados,
+        )
+
+        if not candidatos_femur:
+            return None
+
+        indice_tobillo = TOBILLO_I if lado == "i" else TOBILLO_D
+        rayo_tobillo = self._rayo_a(puntos[indice_tobillo])
+
+        mejor = None
+        mejor_coste = math.inf
+
+        for cadera, rodilla in candidatos_femur:
+            tobillos = _cortar_rayo_con_esfera(
+                rayo_tobillo, rodilla, largo_tibia
+            )
+
+            for tobillo in tobillos:
+                if z_ancla is None:
+                    # Sin ancla todavia: se prefiere la cadena mas
+                    # estirada, que es la correcta estando de pie.
+                    coste = -abs(tobillo[1] - cadera[1])
+                else:
+                    coste = abs(tobillo[2] - z_ancla)
+
+                if coste < mejor_coste:
+                    mejor_coste = coste
+                    mejor = (cadera, rodilla, tobillo)
+
+        return mejor
+
+    def pierna(self, puntos, lado):
+        """Cadera, rodilla y tobillo en 3D. None si no se puede."""
+
+        return self._reconstruir(puntos, lado, self._z_tobillo.get(lado))
+
+    def angulo_rodilla(self, puntos, lado):
+        """Angulo real de la rodilla, en grados. 180 = pierna recta."""
+
+        cadena = self.pierna(puntos, lado)
+
+        if cadena is None:
+            return None
+
+        cadera, rodilla, tobillo = cadena
+
+        muslo = tuple(c - r for c, r in zip(cadera, rodilla))
+        pierna = tuple(t - r for t, r in zip(tobillo, rodilla))
+
+        return _angulo_entre(muslo, pierna)
+
+    def inclinacion_femur(self, puntos, lado):
+        cadena = self.pierna(puntos, lado)
+
+        if cadena is None:
+            return None
+
+        return inclinacion_de((cadena[0], cadena[1]))
+
+
+def _angulo_entre(u, v):
+    modulo_u = math.sqrt(sum(c * c for c in u))
+    modulo_v = math.sqrt(sum(c * c for c in v))
+
+    if modulo_u < 1e-9 or modulo_v < 1e-9:
+        return None
+
+    coseno = sum(a * b for a, b in zip(u, v)) / (modulo_u * modulo_v)
+
+    return math.degrees(math.acos(min(1.0, max(-1.0, coseno))))
