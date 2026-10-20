@@ -77,6 +77,15 @@ TIMEOUT_LECTURA_MS = 5000
 # que la transmision murio (ej. se cerro la app del celular).
 SEGUNDOS_SIN_FRAME_PARA_CORTAR = 8.0
 
+# Cuanto se queda el resumen de una repeticion en el campo de color
+# antes de volver al veredicto de postura. Tiene que dar para mirarlo
+# de reojo al terminar de subir.
+SEGUNDOS_RESUMEN_REPETICION = 1.5
+
+# Cada cuanto se refresca la cifra de fps. A cada fotograma cambia mas
+# rapido de lo que se alcanza a leer.
+SEGUNDOS_ENTRE_FPS = 0.5
+
 # El giro se guarda en grados y se traduce aqui. Cada clic en las
 # flechas suma o resta 90, igual que girar el celular en la mano.
 ROTACIONES = {
@@ -235,6 +244,7 @@ def primera_familia_disponible(candidatas):
 # Indices de landmarks (MediaPipe Pose, 33 puntos)
 # =================================
 
+NARIZ = 0
 OREJA_D = 8
 HOMBRO_I = 11
 HOMBRO_D = 12
@@ -282,6 +292,24 @@ def medidas_de(points, lado):
 
     La app y calibrar_encorvamiento.py usan esta misma funcion: si
     midieran distinto, el umbral calibrado no valdria para la app.
+
+    Inclinacion y encorvamiento salen positivos hacia ADELANTE, mire la
+    persona a un lado o al otro de la imagen. La misma postura, en
+    espejo, da los mismos numeros:
+
+    >>> derecha = [(0.0, 0.0)] * 33
+    >>> for i, xy in {0: (150, 80), 7: (130, 90), 8: (130, 90),
+    ...               11: (100, 160), 12: (100, 160), 23: (60, 300),
+    ...               24: (60, 300), 25: (80, 420), 26: (80, 420),
+    ...               27: (70, 540), 28: (70, 540)}.items():
+    ...     derecha[i] = xy
+    >>> izquierda = [(200 - x, y) for x, y in derecha]
+    >>> a = medidas_de(derecha, "derecho")
+    >>> b = medidas_de(izquierda, "derecho")
+    >>> round(a["inclinacion"]), round(b["inclinacion"])
+    (16, 16)
+    >>> round(a["joroba"], 3) == round(b["joroba"], 3) > 0
+    True
     """
 
     p = {nombre: points[i] for nombre, i in LADOS[lado].items()}
@@ -289,11 +317,22 @@ def medidas_de(points, lado):
     hombro_medio = punto_medio(points[HOMBRO_I], points[HOMBRO_D])
     cadera_medio = punto_medio(points[CADERA_I], points[CADERA_D])
 
+    # La imagen no sabe donde es "adelante": eso depende de hacia que
+    # lado mire la persona. Sin corregirlo, inclinarse hacia adelante
+    # mirando a la izquierda daba x negativa y la app decia "Inclinado
+    # atras". De perfil la nariz siempre va por delante de la oreja,
+    # asi que su diferencia en x da el sentido de la mirada.
+    sentido = 1.0 if points[NARIZ][0] >= p["oreja"][0] else -1.0
+
     return {
         "rodilla": calcular_angulo(p["cadera"], p["rodilla"], p["tobillo"]),
         "cadera": calcular_angulo(p["hombro"], p["cadera"], p["rodilla"]),
-        "inclinacion": angulo_respecto_vertical(cadera_medio, hombro_medio),
-        "joroba": indice_encorvamiento(p["oreja"], hombro_medio, cadera_medio),
+        "inclinacion": sentido * angulo_respecto_vertical(
+            cadera_medio, hombro_medio
+        ),
+        "joroba": sentido * indice_encorvamiento(
+            p["oreja"], hombro_medio, cadera_medio
+        ),
         "_tronco": (cadera_medio, hombro_medio),
     }
 
@@ -638,7 +677,12 @@ class PoseApp(ctk.CTk):
         self.start_time = 0.0
         self.previous_time = 0.0
         self.fps_medido = 0.0
+        self.fps_mostrado_en = 0.0
         self.alerta_previa = False
+
+        # Hasta cuando el campo de color sigue mostrando el resumen de
+        # la ultima repeticion en vez del veredicto de postura.
+        self.resumen_hasta = 0.0
 
         # Buzon de un solo hueco entre el hilo de proceso y el de la
         # interfaz: solo interesa el ultimo frame, los viejos sobran.
@@ -1399,6 +1443,7 @@ class PoseApp(ctk.CTk):
         self.ultima_salida = None
         self.contador.reiniciar()
         self.frames_descartados = 0
+        self.resumen_hasta = 0.0
 
         self.corriendo = True
         self.sesion += 1
@@ -1677,6 +1722,14 @@ class PoseApp(ctk.CTk):
         self._mostrar_medidas(medidas)
         self._mostrar_frame(salida)
 
+        # Antes solo se escribia al cerrar una repeticion: sin hacer
+        # sentadillas no se veia nunca, y despues quedaba congelada.
+        ahora = time.time()
+
+        if ahora - self.fps_mostrado_en >= SEGUNDOS_ENTRE_FPS:
+            self.fps_mostrado_en = ahora
+            self.valores["fps"].configure(text=f"{self.fps_medido:.0f} fps")
+
         self.after(MS_ENTRE_PINTADOS, lambda: self._pintar(sesion))
 
     def _mostrar_medidas(self, medidas):
@@ -1703,11 +1756,17 @@ class PoseApp(ctk.CTk):
 
             # El texto ya distingue los casos por si solo; el campo de
             # color es lo que se ve a tres metros.
-            self._set_veredicto(
-                postura,
-                COLOR["alerta"] if hay_alerta else COLOR["correcto"],
-                COLOR["sobre_campo"],
-            )
+            #
+            # Mientras dure el resumen de la repeticion no se pinta:
+            # antes este bloque lo pisaba en el fotograma siguiente y
+            # el resumen duraba 16 ms, invisible. La alerta se sigue
+            # calculando, asi que el contador no pierde nada.
+            if time.time() >= self.resumen_hasta:
+                self._set_veredicto(
+                    postura,
+                    COLOR["alerta"] if hay_alerta else COLOR["correcto"],
+                    COLOR["sobre_campo"],
+                )
 
         self._contar_repeticion(medidas.get("rodilla"), hay_alerta)
 
@@ -1799,13 +1858,12 @@ class PoseApp(ctk.CTk):
             COLOR["alerta"] if not terminada.profunda else COLOR["correcto"],
             COLOR["sobre_campo"],
         )
+        self.resumen_hasta = time.time() + SEGUNDOS_RESUMEN_REPETICION
 
         self._set_estado(
             f"Repeticion {terminada.numero}: "
             f"minimo {terminada.angulo_minimo:.0f}°"
         )
-
-        self.valores["fps"].configure(text=f"{self.fps_medido:.0f} fps")
 
     def _mostrar_frame(self, output):
         alto, ancho = output.shape[:2]

@@ -219,8 +219,9 @@ def main():
     media_d, desv_d = resumen("derecho", recogido["derecho"])
     media_e, desv_e = resumen("encorvado", recogido["encorvado"])
 
-    # Se trabaja en valor absoluto porque el signo depende de hacia que
-    # lado mira la persona, y app_pose.py compara con abs().
+    # Se trabaja en valor absoluto porque app_pose.py compara con abs().
+    # medidas_de ya orienta el signo hacia adelante, pero una cabeza
+    # echada hacia atras tambien es una postura a avisar.
     abs_d = abs(media_d)
     abs_e = abs(media_e)
 
