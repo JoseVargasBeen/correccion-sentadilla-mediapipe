@@ -20,3 +20,7 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Medidas corporales de quien usa la app: son datos personales y se
+# regeneran con "Medir perfil", asi que no van al repositorio.
+perfil_corporal.json
