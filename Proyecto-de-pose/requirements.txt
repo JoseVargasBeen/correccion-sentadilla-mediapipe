@@ -1,0 +1,6 @@
+customtkinter>=6.0
+mediapipe>=1.0
+opencv-python>=5.0
+numpy
+pillow
+qrcode>=8.0
