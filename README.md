@@ -6,11 +6,7 @@
 
 **Un sistema que mira cómo haces una sentadilla y te dice qué corregir, en tiempo real,<br>con la cámara del celular y visión por computador en el PC.**
 
-![Python](https://img.shields.io/badge/Python-3-1F7A50?style=flat-square&logo=python&logoColor=white)
-![MediaPipe](https://img.shields.io/badge/MediaPipe-Pose-1F7A50?style=flat-square)
-![OpenCV](https://img.shields.io/badge/OpenCV-5-1F7A50?style=flat-square&logo=opencv&logoColor=white)
-![Flutter](https://img.shields.io/badge/Flutter-Android-1F7A50?style=flat-square&logo=flutter&logoColor=white)
-![Kotlin](https://img.shields.io/badge/Kotlin-nativo-1F7A50?style=flat-square&logo=kotlin&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3-1F7A50?style=flat-square&logo=python&logoColor=white) ![MediaPipe](https://img.shields.io/badge/MediaPipe-Pose-1F7A50?style=flat-square) ![OpenCV](https://img.shields.io/badge/OpenCV-5-1F7A50?style=flat-square&logo=opencv&logoColor=white) ![Flutter](https://img.shields.io/badge/Flutter-Android-1F7A50?style=flat-square&logo=flutter&logoColor=white) ![Kotlin](https://img.shields.io/badge/Kotlin-nativo-1F7A50?style=flat-square&logo=kotlin&logoColor=white)
 
 Semillero de investigación · Ingeniería Mecatrónica · José Vargas
 
